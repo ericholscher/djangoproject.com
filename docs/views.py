@@ -16,7 +16,11 @@ from django_hosts.resolvers import reverse
 from .forms import DocSearchForm
 from .models import Document, DocumentRelease
 from .search import START_SEL, DocumentationCategory
-from .utils import get_doc_path_or_404, get_doc_root_or_404
+from .utils import (
+    DOCS_HTML_SURROGATE_KEY,
+    get_doc_path_or_404,
+    get_doc_root_or_404,
+)
 
 SIMPLE_SEARCH_OPERATORS = ["+", "|", "-", '"', "*", "(", ")", "~"]
 
@@ -99,6 +103,9 @@ def document(request, lang, version, url):
     # Tell Fastly to re-fetch from the origin once a week
     # (we'll invalidate the cache sooner if needed)
     response["Surrogate-Control"] = "max-age=%d" % (7 * 24 * 60 * 60)
+    # Lets non-docs changes that appear on every page (e.g. the site banner)
+    # purge just the rendered HTML from Fastly; see docs.utils.purge_docs_html.
+    response["Surrogate-Key"] = DOCS_HTML_SURROGATE_KEY
     return response
 
 

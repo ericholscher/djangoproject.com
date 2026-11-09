@@ -2,7 +2,9 @@ from decimal import Decimal
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import models
+from django.db import models, transaction
+from django.db.models.signals import post_delete
+from django.dispatch import receiver
 from django.utils import timezone
 from django.utils.dateformat import format as date_format
 from django.utils.translation import gettext_lazy as _
@@ -12,6 +14,7 @@ from djmoney.settings import CURRENCIES
 from docutils.core import publish_parts
 
 from blog.models import BLOG_DOCUTILS_SETTINGS
+from docs.utils import purge_docs_html
 
 
 class Office(models.Model):
@@ -261,9 +264,24 @@ class Banner(models.Model):
             )
 
     def save(self, *args, **kwargs):
+        was_active = (
+            self.pk is not None
+            and Banner.objects.filter(pk=self.pk, is_active=True).exists()
+        )
         if self.is_active:
             Banner.objects.exclude(pk=self.pk).update(is_active=False)
         super().save(*args, **kwargs)
+        if self.is_active or was_active:
+            # Docs pages are cached in Fastly for a week, so purge them or the
+            # change won't show on docs.djangoproject.com until the next rebuild.
+            transaction.on_commit(purge_docs_html)
+
+
+@receiver(post_delete, sender=Banner)
+def purge_docs_html_on_active_banner_delete(sender, instance, **kwargs):
+    # A signal rather than Banner.delete(), so the admin's bulk delete is covered.
+    if instance.is_active:
+        transaction.on_commit(purge_docs_html)
 
 
 class Business(models.Model):

@@ -2,12 +2,14 @@ import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, override_settings
 
 from ..utils import (
     capture_sentry_exception,
     extract_inner_html,
     get_doc_path,
+    purge_docs_html,
+    purge_fastly,
     sanitize_for_trigram,
 )
 
@@ -106,3 +108,23 @@ class TestUtils(SimpleTestCase):
     def test_extract_inner_html_tag_not_found_raises(self):
         with self.assertRaisesMessage(ValueError, "<main> not found in HTML."):
             extract_inner_html("<p>Test</p>", tag="main")
+
+
+@override_settings(
+    FASTLY_SERVICE_URL="https://api.fastly.com/service/abc",
+    FASTLY_API_KEY="key",
+)
+@patch("docs.utils.requests.Session.post")
+class PurgeFastlyTests(SimpleTestCase):
+    def test_soft_purge(self, post):
+        post.return_value.json.return_value = {"status": "ok"}
+        purge_fastly("purge/some-key", soft=True)
+        self.assertEqual(
+            post.call_args.args[0], "https://api.fastly.com/service/abc/purge/some-key"
+        )
+        self.assertEqual(post.call_args.kwargs["headers"]["Fastly-Soft-Purge"], "1")
+
+    def test_purge_docs_html_logs_errors(self, post):
+        post.return_value.json.return_value = {"status": "error"}
+        with self.assertLogs("docs.utils", "ERROR"):
+            purge_docs_html()

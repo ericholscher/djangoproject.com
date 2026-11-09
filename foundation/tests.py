@@ -1,4 +1,5 @@
 from datetime import date
+from unittest import mock
 
 from django.contrib.auth.models import Permission, User
 from django.core.exceptions import ValidationError
@@ -9,6 +10,23 @@ from djmoney.money import Money
 from djangoproject.tests import ReleaseMixin
 
 from .models import ApprovedGrant, Banner, BoardMember, Business, Meeting, Office, Term
+
+
+@mock.patch("foundation.models.purge_docs_html")
+class BannerCachePurgeTests(TestCase):
+    def test_active_banner_changes_purge(self, purge):
+        with self.captureOnCommitCallbacks(execute=True):
+            banner = Banner.objects.create(title="Live", is_active=True)
+            banner.is_active = False
+            banner.save()
+        self.assertEqual(purge.call_count, 2)
+
+    def test_inactive_banner_changes_dont_purge(self, purge):
+        with self.captureOnCommitCallbacks(execute=True):
+            banner = Banner.objects.create(title="Draft")
+            banner.save()
+            banner.delete()
+        purge.assert_not_called()
 
 
 class BannerTestCase(ReleaseMixin, TestCase):

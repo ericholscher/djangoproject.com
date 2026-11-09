@@ -1,10 +1,87 @@
+import logging
 import re
 import unicodedata
 from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urljoin
 
+import requests
 from django.conf import settings
+from django.core.cache import caches
 from django.http import Http404
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+logger = logging.getLogger(__name__)
+
+# Fastly surrogate key set on every rendered docs page (but not static assets).
+DOCS_HTML_SURROGATE_KEY = "docs-html"
+
+
+class FastlyPurgeError(Exception):
+    pass
+
+
+def purge_fastly(path, *, soft=False, retries=5):
+    """
+    Send a purge request to the docs Fastly service, e.g. ``purge_all`` or
+    ``purge/<surrogate key>``. Requires these settings:
+
+    * settings.FASTLY_SERVICE_URL: the full URL to the "Django Docs" Fastly
+      service API endpoint e.g.,
+      https://api.fastly.com/service/SU1Z0isxPaozGVKXdv0eY/
+      (a trailing slash will be added for you if you don't supply one)
+    * settings.FASTLY_API_KEY: your Fastly API key with "purge_all" and
+      "purge_select" scope for the above Django Docs service
+
+    A soft purge marks the content stale instead of removing it, so Fastly
+    keeps serving it while it refetches from the origin.
+
+    Raise FastlyPurgeError if the settings are missing or the purge fails.
+    """
+    service_url = getattr(settings, "FASTLY_SERVICE_URL", None)
+    api_key = getattr(settings, "FASTLY_API_KEY", None)
+    if not (service_url and api_key):
+        raise FastlyPurgeError(
+            "Fastly API key and/or service URL not found; can't purge cache"
+        )
+    # Make sure service_url ends with a trailing slash; otherwise, urljoin()
+    # will lop off the last part of the path. If needed, urljoin() will remove
+    # any duplicate slashes for us.
+    url = urljoin(service_url + "/", path)
+    session = requests.Session()
+    # Make some allowance for temporary network failures.
+    retry = Retry(total=retries, allowed_methods={"POST"}, backoff_factor=0.1)
+    session.mount(url, HTTPAdapter(max_retries=retry))
+    headers = {"Fastly-Key": api_key, "Accept": "application/json"}
+    if soft:
+        headers["Fastly-Soft-Purge"] = "1"
+    try:
+        result = session.post(url, headers=headers, timeout=5).json()
+    except (requests.RequestException, ValueError) as e:
+        raise FastlyPurgeError(f"Fastly purge failed for URL: {url}; {e}") from e
+    if result.get("status") != "ok":
+        raise FastlyPurgeError(f"Fastly purge failed for URL: {url}; result={result}")
+
+
+def purge_docs_html():
+    """
+    Purge rendered docs pages from Django's docs-pages cache and Fastly.
+
+    Used when something shared by every docs page changes, such as the site
+    banner. Django's cache is cleared first so Fastly doesn't re-cache the old
+    HTML from it, then the docs-html surrogate key is soft purged so Fastly
+    doesn't send every docs page to the origin at once.
+
+    Errors are logged rather than raised so that callers, like a banner save
+    in the admin, aren't broken by a CDN outage.
+    """
+    caches["docs-pages"].clear()
+    try:
+        purge_fastly(f"purge/{DOCS_HTML_SURROGATE_KEY}", soft=True, retries=1)
+    except FastlyPurgeError:
+        logger.exception("Couldn't purge rendered docs pages from Fastly")
+
 
 try:
     import sentry_sdk
