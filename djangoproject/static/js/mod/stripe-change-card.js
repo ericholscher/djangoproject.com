@@ -15,6 +15,7 @@ define([
         var data = {
           stripe_token: token.id,
           donation_id: donationId,
+          hero: $heroForm.data('hero'),
           csrfmiddlewaretoken: csrfToken,
         };
         $.ajax({

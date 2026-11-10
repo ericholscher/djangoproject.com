@@ -15,7 +15,6 @@ from releases.models import Release
 
 
 class Factory:
-
     def make_user(self, perm_names=None, **kwargs):
         username = kwargs.setdefault("username", f"username-{uuid4()}")
         kwargs.setdefault("email", f"{username}@example.com")
@@ -31,7 +30,11 @@ class Factory:
     def make_release(self, **kwargs):
         version = kwargs.setdefault("version", "5.2")
         kwargs.setdefault("date", date(2025, 4, 2))
-        kwargs.setdefault("is_lts", version.split(".", 1)[1].startswith("2"))
+        # Under the A.B version scheme the .2 series are the LTS ones.
+        # Calendar versions have no minor component, and `Release.save()` marks
+        # them all as LTS regardless of what is passed here.
+        _, _, minor = version.partition(".")
+        kwargs.setdefault("is_lts", minor.startswith("2"))
         return Release.objects.create(**kwargs)
 
     def make_releaser(self, user=None):

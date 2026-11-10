@@ -1,7 +1,7 @@
 version: 2
 updates:
-    - package-ecosystem: "pip"
-      directory: "/requirements/"
+    - package-ecosystem: "uv"
+      directory: "/"
       schedule:
           interval: "weekly"
           day: "monday"
@@ -17,5 +17,15 @@ updates:
           day: "monday"
           time: "12:00"
           timezone: "Europe/Oslo" # hipp hipp hurra
+      cooldown:
+          default-days: 7
+
+    - package-ecosystem: "pre-commit"
+      directory: /
+      schedule:
+          interval: "weekly"
+          day: "monday"
+          time: "12:00"
+          timezone: "Europe/Oslo"
       cooldown:
           default-days: 7

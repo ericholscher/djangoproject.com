@@ -16,7 +16,11 @@ from django_hosts.resolvers import reverse
 from .forms import DocSearchForm
 from .models import Document, DocumentRelease
 from .search import START_SEL, DocumentationCategory
-from .utils import get_doc_path_or_404, get_doc_root_or_404
+from .utils import (
+    DOCS_HTML_SURROGATE_KEY,
+    get_doc_path_or_404,
+    get_doc_root_or_404,
+)
 
 SIMPLE_SEARCH_OPERATORS = ["+", "|", "-", '"', "*", "(", ")", "~"]
 
@@ -99,6 +103,9 @@ def document(request, lang, version, url):
     # Tell Fastly to re-fetch from the origin once a week
     # (we'll invalidate the cache sooner if needed)
     response["Surrogate-Control"] = "max-age=%d" % (7 * 24 * 60 * 60)
+    # Lets non-docs changes that appear on every page (e.g. the site banner)
+    # purge just the rendered HTML from Fastly; see docs.utils.purge_docs_html.
+    response["Surrogate-Key"] = DOCS_HTML_SURROGATE_KEY
     return response
 
 
@@ -171,12 +178,9 @@ def search_results(request, lang, version, per_page=10, orphans=3):
             if exact is not None:
                 return redirect(exact)
 
-            results = Document.objects.search(
-                q, release, document_category=doc_category
-            )
-
+            ranked = Document.objects.rank(q, release, document_category=doc_category)
             page_number = request.GET.get("page") or 1
-            paginator = Paginator(results, per_page=per_page, orphans=orphans)
+            paginator = Paginator(ranked, per_page=per_page, orphans=orphans)
 
             try:
                 page_number = int(page_number)
@@ -185,7 +189,7 @@ def search_results(request, lang, version, per_page=10, orphans=3):
                     page_number = paginator.num_pages
                 else:
                     raise Http404(
-                        _("Page is not 'last', " "nor can it be converted to an int.")
+                        _("Page is not 'last', nor can it be converted to an int.")
                     )
 
             try:
@@ -196,11 +200,16 @@ def search_results(request, lang, version, per_page=10, orphans=3):
                     % {"page_number": page_number, "message": str(e)}
                 )
 
+            page_results = Document.objects.annotate_search_results(
+                page.object_list, q, uses_trigram=ranked.uses_trigram
+            )
+
             context.update(
                 {
                     "query": q,
                     "page": page,
                     "paginator": paginator,
+                    "page_results": page_results,
                     "start_sel": START_SEL,
                     "DocumentationCategory": DocumentationCategory,
                 }

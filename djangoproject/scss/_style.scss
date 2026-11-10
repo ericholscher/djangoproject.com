@@ -694,20 +694,41 @@ header {
     }
 
     .banner {
+        display: flex;
+        flex-direction: column;
+        gap: 1em;
         text-align: center;
-        padding: 1em 3em;
+        // Narrower side padding than desktop widens the text column on mobile
+        // (fewer wrapped lines), while vertical padding stays comfortable.
+        padding: 1em 1.25em;
         max-width: 60em;
         margin: 0 auto;
-        p {
-            @include sans-serif;
-            font-size: 3.2rem;
-            font-weight: 300;
-            margin: 0.35em 0 0.35em;
-            line-height: 1.3;
-            padding: 1px 0 6px;
+
+        @include sans-serif;
+        font-size: 1.8rem;
+        font-weight: 300;
+        line-height: 1.4;
+
+        @include respond-min(768px) {
+            padding: 1em 3em;
         }
+
+        // gap owns the spacing between items; clear the inherited margins
+        // (the h2 UA default and the global .cta margins) so the gaps stay
+        // uniform and the outer edges are defined by the container padding.
+        > * {
+            margin: 0;
+        }
+
+        .cta {
+            box-sizing: border-box;
+            width: 100%;
+            max-width: 400px;
+            margin: 0 auto;
+        }
+
         .underlined {
-          text-decoration: underline;
+            text-decoration: underline;
         }
     }
 
@@ -1387,7 +1408,12 @@ label[for] {
   font-weight: bold;
 }
 
-.errorlist {
+// .errorlist is used by Django
+// .errors and .error are used by manually written forms
+.errorlist,
+.errors,
+p.error,
+span.error {
   color: var(--error-fg);
   background-color: var(--error-light-l10);
   border-radius: .3em;
@@ -1570,6 +1596,10 @@ label[for] {
         a:link {
             color: var(--text-light);
             text-decoration: underline;
+        }
+
+        span.featured {
+            text-transform: uppercase;
         }
     }
 }
@@ -1860,19 +1890,6 @@ h2+.list-link-soup {
                 &.inview {
                     background-position: -334px -12px;
                 }
-            }
-
-            // Fixing opera svg-border-radius bug
-            // http://stackoverflow.com/questions/11114636/opera-border-radius-svg-background-bug
-            :-o-prefocus,
-            & {
-                background: $green-medium !important;
-
-                -webkit-transition: none !important;
-                transition: none !important;
-
-                -webkit-transform: none !important;
-                transform: none !important;
             }
         }
     }
@@ -2541,11 +2558,13 @@ h2+.list-link-soup {
     }
 }
 
-.versionadded,
-.versionchanged,
-.versionmodified {
+// Version annotations. Each Django version's docs are built from their own
+// source, so two markup shapes must work at once.
+div.versionadded,
+div.versionchanged,
+div.versionremoved,
+div.deprecated {
     @include sans-serif;
-    font-weight: bold;
     margin-bottom: 20px;
 
     padding: 10px 13px;
@@ -2553,37 +2572,34 @@ h2+.list-link-soup {
     border-radius: 4px;
 
     p {
-        font-weight: normal;
-        margin-top: 0.3em;
+        // Tighter than body text, so the box reads as one unit.
+        margin: 0.3em 0;
+
+        // `span.versionmodified` shares this paragraph.
+        &:first-child {
+            margin-top: 0;
+        }
 
         &:last-child {
             margin-bottom: 0;
         }
     }
-}
 
-.deprecated {
-    @extend .versionchanged;
-
-    .versionadded,
-    .versionchanged,
-    .versionmodified {
-        border: none;
-        padding: 0;
-        margin-bottom: 0;
+    // `span.versionmodified` appears just inside the first `p`. (It also has
+    // the directive name as a class, hence scoping the box above to `div`.)
+    // `span.title` is used only for versionadded and versionchanged in Django
+    // 6.1 and earlier. It appears before (outside) the first `p`.
+    span.versionmodified,
+    span.title {
         display: block;
-    }
+        font-weight: bold;
 
-    p {
-        font-weight: normal;
-        margin-top: 0;
-
-        &:last-child {
-            margin-bottom: 0;
+        // A directive with no body renders as the label alone, and then the
+        // gap would just pad the bottom of the box.
+        &:not(:only-child) {
+            margin-bottom: 0.3em;
         }
     }
-
-
 }
 
 dl.function,
@@ -2627,6 +2643,57 @@ table {
     th {
         padding: 0.5em 1em;
     }
+}
+
+// Wide tables break out of the content column and centre on the viewport.
+// 96vw leaves room for the scrollbar, so the page never scrolls sideways.
+// Below 768px the content column is already nearly the full screen width.
+.table-wrapper-wide {
+    @include respond-min(768px) {
+        width: 96vw;
+        max-width: 1160px;
+        margin-left: 50%;
+        transform: translateX(-50%);
+    }
+}
+
+// Sponsor prospectus page at /sponsor/.
+.sponsor-image {
+    display: block;
+    max-width: 100%;
+    height: auto;
+}
+
+.sponsor-figure {
+    margin: 0 0 30px;
+
+    figcaption {
+        margin-top: 10px;
+        font-size: 13px;
+        line-height: 1.6;
+        color: color-mix(in srgb, var(--body-fg) 70%, transparent);
+    }
+}
+
+table.sponsor-tiers,
+table.sponsor-reach {
+    width: 100%;
+}
+
+table.sponsor-tiers {
+    // Seven columns do not fit the content column, so the table scrolls
+    // sideways inside its .table-wrapper on narrow screens.
+    min-width: 920px;
+    table-layout: fixed;
+
+    th:first-child,
+    td:first-child {
+        width: 28%;
+    }
+}
+
+table.sponsor-reach {
+    min-width: 640px;
 }
 
 table.foundation td {
@@ -3354,6 +3421,38 @@ hr {
     }
 }
 
+// The corporate ask on /fundraising/, pulled out of the donation progress
+// bullets so it reads as its own invitation rather than a footnote to them.
+.corporate-callout {
+    margin: 40px 0;
+    padding: 28px 30px;
+    border-radius: 8px;
+    border-left: 4px solid var(--primary-accent);
+    background: var(--sidebar-bg);
+
+    h2 {
+        margin-top: 0;
+        // The intro link jumps to this heading, so leave the box's padding
+        // plus a gap above it and the callout lands as a whole block.
+        scroll-margin-top: 52px;
+    }
+
+    > p {
+        max-width: 60ch;
+    }
+
+    .corporate-callout-actions {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 24px;
+    }
+
+    .cta {
+        margin: 0;
+    }
+}
+
 .fundraising-index {
     .donate {
         select {
@@ -3748,5 +3847,46 @@ ul.corporate-members li {
 
     &:focus {
         top: 0;
+    }
+}
+
+// Sponsorship banner landing page (/sponsor/banner/)
+// The screenshot is 2560px wide, so it breaks out of the content column the
+// same way a wide table does. See .table-wrapper-wide above for the technique.
+.sponsor-placement {
+    margin: 30px 0 0;
+
+    @include respond-min(768px) {
+        width: 96vw;
+        max-width: 1160px;
+        margin-left: 50%;
+        transform: translateX(-50%);
+    }
+
+    img {
+        display: block;
+        height: auto;
+        max-width: 100%;
+    }
+
+    figcaption {
+        margin: 10px 0 0;
+        text-align: center;
+    }
+}
+
+// Django renders radio groups in a fieldset; make it read like the other fields.
+.sponsor-form fieldset {
+    border: 0;
+    margin: 10px 0 20px;
+    padding: 0;
+
+    legend {
+        font-weight: 700;
+        margin-bottom: 10px;
+    }
+
+    label {
+        font-weight: 400;
     }
 }

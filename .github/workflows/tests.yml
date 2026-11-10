@@ -28,9 +28,9 @@ jobs:
                     - 5432:5432
 
         steps:
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7.0.1
             - name: Set up Python
-              uses: actions/setup-python@v6
+              uses: actions/setup-python@v7
               with:
                   python-version: ${{ env.PYTHON_VERSION }}
             - name: Install gettext
@@ -41,7 +41,7 @@ jobs:
                   python -m pip install -r requirements/tests.txt
             - name: Install playwright browsers
               run: |
-                  python -m playwright install --with-deps chromium
+                  python -m playwright install --with-deps chromium firefox
             - name: Set up databases
               run: |
                   PGPASSWORD="postgres" createuser -U postgres -d djangoproject --superuser -h localhost
@@ -65,10 +65,10 @@ jobs:
 
             - name: Run tests
               run: |
-                  make ci
+                  make ci TEST_ARGS="--browser chromium --browser firefox"
                   coverage xml
 
             - name: Upload coverage reports to Codecov
-              uses: codecov/codecov-action@v6
+              uses: codecov/codecov-action@v7.1.0
               with:
                   token: ${{ secrets.CODECOV_TOKEN }}

@@ -25,7 +25,12 @@ CACHES = {
 
 CSRF_COOKIE_SECURE = False
 
-EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+MAILERS = {
+    "default": {
+        "BACKEND": "django.core.mail.backends.console.EmailBackend",
+    },
+}
+
 
 MEDIA_ROOT = DATA_DIR / "media_root"
 
@@ -66,3 +71,13 @@ SILENCED_SYSTEM_CHECKS = SILENCED_SYSTEM_CHECKS + [
     # Default test keys for development.
     "django_recaptcha.recaptcha_test_key_error"
 ]
+
+# Google's default test keys always verify successfully but return no score,
+# which would be read as a zero and rejected by the production threshold. Turn
+# the score check off so that captcha protected forms can be submitted locally.
+RECAPTCHA_REQUIRED_SCORE = 0
+
+# The test keys also report no v3 "action" from the verification endpoint,
+# which django-recaptcha 4.1+ rejects for a widget that sets one. Turn the
+# action check off for the same reason.
+RECAPTCHA_ACTION = None

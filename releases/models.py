@@ -10,31 +10,40 @@ from django.core.files.storage import FileSystemStorage
 from django.core.validators import RegexValidator
 from django.db import models
 from django.utils.functional import cached_property
-from django.utils.version import get_complete_version, get_main_version
 
-from .utils import get_loose_version_tuple
+from .utils import (
+    get_django_version_tuple,
+    get_feature_version,
+    get_main_version,
+    get_version_tuple,
+    is_calendar_version,
+)
 
 
-# A version of django.utils.version.get_version() which maps "rc" to "rc"
-# (packages generated using setuptools 8+) instead of "c" (older versions of
-# setuptools). This naming schemes starts with Django 1.9 and we don't care
-# about older release candidates. Safe to use Django's copy of get_version()
-# when upgrading this website to use Django 1.10.
-def get_version(version=None):
-    """Return a PEP 386-compliant version number from VERSION."""
-    version = get_complete_version(version)
-
-    # Now build the two parts of the version number:
-    # main = X.Y[.Z]
+# Adapted from django.utils.version.get_version(), dropping the ".devN" suffix
+# it appends to an alpha 0, as that inspects the local git repository, which is
+# this website rather than Django, and building the main version with the local
+# get_main_version(), aware of calendar versions (DEP 20).
+#
+# Django 6.2: core's own get_version() serves both schemes from then on, but
+# keep this one unless we are content for a release row to reach the git
+# subprocess. Only an alpha 0 does, and no such release is ever published.
+def get_version(version):
+    """Return a PEP 440-compliant version number from a version tuple."""
+    # The two parts of the version number:
+    # main = A.B[.C] or YYYY[.N]
     # sub = {a|b|rc}N - for alpha, beta and rc releases
     main = get_main_version(version)
 
+    # Read the status from the end, as calendar versions have one component
+    # less than A.B.C ones, and so shift every index before it.
+    *_, status, iteration = version
     sub = ""
-    if version[3] != "final":
+    if status != "final":
         mapping = {"alpha": "a", "beta": "b", "rc": "rc"}
-        sub = mapping[version[3]] + str(version[4])
+        sub = mapping[status] + str(iteration)
 
-    return str(main + sub)
+    return main + sub
 
 
 class ReleaseManager(models.Manager):
@@ -77,17 +86,30 @@ class ReleaseManager(models.Manager):
         """
         if at is None:
             at = datetime.date.today()
-        excluded_major_minor = {
-            (release.major, release.minor) for release in self.supported(at)
-        }
+        # The feature version names a series under either scheme. Grouping by
+        # (major, minor) would split a calendar series into one entry per patch
+        # release, as minor is the patch number there. See DEP 20.
+        seen_series = {release.feature_version for release in self.supported(at)}
         unsupported = []
         for release in self.filter(major__gte=1, eol_date__lte=at, status="f").order_by(
             "-major", "-minor", "-micro"
         ):
-            if (release.major, release.minor) not in excluded_major_minor:
-                excluded_major_minor.add((release.major, release.minor))
+            if release.feature_version not in seen_series:
+                seen_series.add(release.feature_version)
                 unsupported.append(release)
         return unsupported
+
+    def in_feature_series(self, release):
+        """
+        Final releases in the same feature series as `release`, newest first.
+
+        A calendar version's series is its year alone, as its minor component
+        is the patch number, while an A.B one's is major and minor together.
+        """
+        series = {"major": release.major}
+        if not release.is_calendar_version:
+            series["minor"] = release.minor
+        return self.filter(status="f", **series).order_by("-minor", "-micro")
 
     def current(self, at=None):
         """
@@ -106,18 +128,6 @@ class ReleaseManager(models.Manager):
         List of supported LTS releases.
         """
         return self.supported(at).filter(is_lts=True)
-
-    def current_lts(self, at=None):
-        """
-        Current LTS release.
-        """
-        return self.lts(at).first()
-
-    def previous_lts(self, at=None):
-        """
-        Previous LTS release or None if there's only one LTS release currently.
-        """
-        return self.lts(at)[1:].first()
 
     def preview(self, at=None):
         """
@@ -141,6 +151,16 @@ class ReleaseManager(models.Manager):
         return current_version
 
 
+# Artifact file names are Django-<version><suffix>, where the suffix is
+# .tar.gz for tarballs and -py3-none-any.whl for wheels. Release.clean()
+# validates the whole name; this only extracts the version, so that an
+# artifact is never filed under a release it doesn't belong to.
+artifact_name_re = re.compile(
+    r"^[^-]+-(?P<version>[^-]+?)(?:\.tar\.[a-z]+|-py3-none(?:-any)?\.whl)$",
+    re.IGNORECASE,
+)
+
+
 def get_storage():
     """
     Return a FileSystemStorage that allows file name overwrites.
@@ -152,8 +172,14 @@ def get_storage():
 
 
 def upload_to_artifact(release, filename):
-    major, minor = release.version_tuple[:2]
-    return f"releases/{major}.{minor}/{filename}"
+    name = Path(filename).name
+    version = get_version(release.version_tuple)
+    match = artifact_name_re.match(name)
+    if match is None or match["version"] != version:
+        raise ValidationError(
+            f"Filename {name} does not belong to the {version} release."
+        )
+    return f"releases/{release.feature_version}/{filename}"
 
 
 def upload_to_checksum(release, filename):
@@ -213,7 +239,8 @@ class Release(models.Model):
         "Long Term Support",
         help_text=(
             'Is this a release for an <abbr title="Long Term Support">LTS</abbr> '
-            "Django version (e.g. 5.2a1, 5.2, 5.2.4)?"
+            "Django version (e.g. 5.2a1, 5.2, 5.2.4)? Always set for calendar "
+            "versions, which are all supported for three years."
         ),
         default=False,
     )
@@ -242,6 +269,10 @@ class Release(models.Model):
     def save(self, *args, **kwargs):
         self.major, self.minor, self.micro, status, self.iteration = self.version_tuple
         self.status = self.STATUS_REVERSE[status]
+        # DEP 20 gives every calendar version three years of support, retiring
+        # the LTS label as a distinguishing one. Set here rather than as a
+        # field default, which cannot know the version.
+        self.is_lts = self.is_lts or is_calendar_version(self.major)
         cache.delete(self.DEFAULT_CACHE_KEY)
         super().save(*args, **kwargs)
         if self.is_active:
@@ -260,20 +291,17 @@ class Release(models.Model):
 
     @cached_property
     def version_tuple(self):
-        """Return a tuple in the format of django.VERSION."""
-        version = self.version.replace("-", "").replace("_", "")
-        version = list(get_loose_version_tuple(version))
-        if len(version) == 2:
-            version.append(0)
-        if not isinstance(version[2], int):
-            version.insert(2, 0)
-        if len(version) == 3:
-            version.append("final")
-        if version[3] not in ("alpha", "beta", "rc", "final"):
-            version[3] = {"a": "alpha", "b": "beta", "c": "rc"}[version[3]]
-        if len(version) == 4:
-            version.append(0)
-        return tuple(version)
+        """Return the five components backing the major/minor/micro fields."""
+        return get_version_tuple(self.version)
+
+    @cached_property
+    def django_version_tuple(self):
+        """Return the version tuple as django.VERSION spells it.
+
+        Django 6.2: return a django.utils.version.VersionTuple instead, and
+        drop get_django_version_tuple().
+        """
+        return get_django_version_tuple(self.version)
 
     @cached_property
     def version_verbose(self):
@@ -285,7 +313,7 @@ class Release(models.Model):
 
     @cached_property
     def feature_version(self):
-        return f"{self.major}.{self.minor}"
+        return get_feature_version(self.version)
 
     @cached_property
     def feature_release(self):
@@ -309,9 +337,29 @@ class Release(models.Model):
         return self.status != "f"
 
     @cached_property
+    def is_calendar_version(self):
+        """Return True if this release is calendar versioned (YYYY[.N])."""
+        # The module level function, not this property.
+        return is_calendar_version(self.major)
+
+    @cached_property
+    def show_lts_label(self):
+        """Return True if this release should be labelled LTS to readers.
+
+        The flag stays set for calendar versions, which are all supported for
+        three years, but the label is not shown for them: it only ever meant
+        "supported for longer than the others". See DEP 20.
+        """
+        return self.is_lts and not self.is_calendar_version
+
+    @cached_property
     def is_dot_zero(self):
-        """Return True if this is a final X.Y.0 release."""
-        return self.status == "f" and self.micro == 0
+        """Return True if this is a final feature release (X.Y or YYYY)."""
+        return (
+            self.status == "f"
+            and self.micro == 0
+            and (not self.is_calendar_version or self.minor == 0)
+        )
 
     def __lt__(self, other):
         return self.version_tuple < other.version_tuple
@@ -367,6 +415,8 @@ class Release(models.Model):
             previous_release_kwargs["status"] = "a"
         elif self.status == "c":
             previous_release_kwargs["status"] = "b"
+        elif self.status == "f" and self.is_calendar_version and self.minor > 0:
+            previous_release_kwargs["minor"] = self.minor - 1
         elif self.status == "f" and self.micro == 0:
             previous_release_kwargs["status"] = "c"
         elif self.status == "f" and self.micro > 0:

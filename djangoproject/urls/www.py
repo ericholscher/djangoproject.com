@@ -13,9 +13,11 @@ from accounts import views as account_views
 from aggregator.feeds import CommunityAggregatorFeed, CommunityAggregatorFirehoseFeed
 from blog.feeds import WeblogEntryFeed
 from blog.sitemaps import WeblogSitemap
+from contact.views import BannerSponsorship
 from djangoproject.sitemaps import TemplateViewSitemap
 from foundation.feeds import FoundationMinutesFeed
 from foundation.views import BannerPreview, CoreDevelopers
+from fundraising import views as fundraising_views
 
 admin.autodiscover()
 
@@ -110,10 +112,31 @@ urlpatterns = [
         BannerPreview.as_view(),
         name="foundation_banner_preview",
     ),
-    path("foundation/django_core/", CoreDevelopers.as_view()),
+    path(
+        "foundation/django_core/",
+        CoreDevelopers.as_view(),
+        name="foundation_core_developers",
+    ),
     path("foundation/minutes/", include("foundation.urls.meetings")),
     path("foundation/", include("members.urls")),
     path("fundraising/", include("fundraising.urls")),
+    path("sponsor/", fundraising_views.sponsor, name="sponsor"),
+    path(
+        "sponsor/plans/",
+        fundraising_views.sponsor_prospectus,
+        name="sponsor_prospectus_plans",
+    ),
+    path(
+        "sponsor/plans/<slug:slug>/",
+        fundraising_views.sponsor_plan,
+        name="sponsor_plan",
+    ),
+    path(
+        "sponsor/plans/<slug:slug>/sent/",
+        fundraising_views.sponsor_plan_sent,
+        name="sponsor_plan_sent",
+    ),
+    path("sponsor/banner/", BannerSponsorship.as_view(), name="sponsor_banner"),
     # Used by docs search suggestions
     re_path(
         r"^r/(?P<content_type_id>\d+)/(?P<object_id>.*)/$",

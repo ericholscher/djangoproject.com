@@ -1,0 +1,95 @@
+{% extends "sponsor/base.html" %}
+{% load humanize i18n %}
+{% block title %}{% translate "Sponsor Django" %}{% endblock %}
+
+{% block og_title %}{% translate "Sponsor Django" %}{% endblock %}
+
+{% block description %}{% translate "Find your way to support Django: sponsor a Fellow, become a corporate member, or reach developers with a website banner." %}{% endblock %}
+
+{% block content %}
+  <div class="plan-hero sponsor-overview-hero">
+    <div class="sponsor-intro">
+      <p class="sponsor-eyebrow">{% translate "Django Software Foundation" %}</p>
+      <h1>{% blocktranslate trimmed %}Your business runs on Django.<br>Help Django thrive.{% endblocktranslate %}</h1>
+      <p>
+        {% blocktranslate trimmed %}
+          Invest in the people who keep Django secure, reliable, and moving
+          forward. Choose an annual partnership, or put your next campaign in
+          front of Django developers.
+        {% endblocktranslate %}
+      </p>
+      <div class="sponsor-actions"><a class="plan-button" href="#corporate-membership-tiers">{% translate "Explore annual plans" %} <span aria-hidden="true">↓</span></a><a href="#banner-sponsorship">{% translate "Looking for a banner sponsorship?" %} →</a></div>
+      <p class="sponsor-note">{% translate "Giving on behalf of yourself?" %} <a href="{% url 'fundraising:index' %}">{% translate "Make an individual donation" %} →</a></p>
+    </div>
+    <aside class="plan-sidebar" aria-label="{% translate 'Django community statistics' %}">
+      {% include "sponsor/stats.html" %}
+    </aside>
+  </div>
+  <section class="sponsor-section" id="corporate-membership-tiers" aria-labelledby="annual-heading">
+    <div class="sponsor-section-heading"><div><p class="sponsor-eyebrow">{% translate "An ongoing investment" %}</p><h2 id="annual-heading">{% translate "A partnership for every stage." %}</h2></div><p>{% blocktranslate trimmed %}Annual corporate memberships.<br>All amounts in US dollars.{% endblocktranslate %}</p></div>
+    <div class="plan-grid">{% for plan in plans|slice:":3" %}{% include "sponsor/card.html" %}{% endfor %}<div class="plan-stack">{% for plan in plans|slice:"3:" %}{% include "sponsor/card-compact.html" %}{% endfor %}</div></div>
+    <aside class="sponsor-plan-guide" aria-labelledby="plan-guide-heading">
+      <h3 id="plan-guide-heading">{% translate "Find your starting point" %}</h3>
+      <p>{% translate "Consider your company's size, how much you rely on Django, and the annual support you can sustain." %}</p>
+      <ul>
+        <li>
+          {% blocktranslate trimmed %}
+            <strong>Larger organizations investing in Django's future:</strong>
+            consider <a href="#plan-diamond">Diamond</a> for leadership
+            connections, or <a href="#plan-fellow">Sponsored Fellow</a> for direct
+            engagement with the people maintaining Django.
+          {% endblocktranslate %}
+        </li>
+        <li>
+          {% blocktranslate trimmed %}
+            <strong>Growing companies building on Django:</strong> explore
+            <a href="#plan-gold">Gold</a> for newsletter and blog opportunities, or
+            <a href="#plan-platinum">Platinum</a> for more frequent promotion and
+            wider website visibility.
+          {% endblocktranslate %}
+        </li>
+        <li>
+          {% blocktranslate trimmed %}
+            <strong>Small teams starting to give back:</strong> choose
+            <a href="#plan-bronze">Bronze</a> for core recognition, or
+            <a href="#plan-silver">Silver</a> to share company news throughout the
+            year.
+          {% endblocktranslate %}
+        </li>
+      </ul>
+      <p class="sponsor-note">
+        {% url 'contact_foundation' as contact_url %}
+        {% blocktranslate trimmed %}
+          Any company can choose any tier. For a short campaign,
+          <a href="#banner-sponsorship">explore weekly or monthly banners</a>. For
+          help choosing, <a href="{{ contact_url }}">talk to the Foundation</a>.
+        {% endblocktranslate %}
+      </p>
+    </aside>
+    <p class="sponsor-note">{% translate "Every annual plan includes a corporate member listing, a member badge, and recognition in the DSF annual report." %} <a href="{% url 'sponsor_prospectus_plans' %}#corporate-membership-tiers">{% translate "Compare every benefit in the full prospectus" %} →</a></p>
+  </section>
+  <section class="sponsor-banner-offer" id="banner-sponsorship" aria-labelledby="banner-heading">
+    <div>
+      <p class="sponsor-eyebrow">{% translate "A focused campaign" %}</p>
+      <h2 id="banner-heading">{% blocktranslate trimmed %}Be seen where Django<br>developers work.{% endblocktranslate %}</h2>
+      <p>
+        {% blocktranslate trimmed %}
+          Launching a product, hiring, or building awareness? Sponsor a banner on
+          the Django website and documentation while supporting the Foundation.
+        {% endblocktranslate %}
+      </p>
+      <a href="{% url 'sponsor_banner' %}">{% translate "See the placement and explore banner sponsorship" %} →</a>
+    </div>
+    <div class="banner-options">
+      <div><h3>{% translate "One week" %}</h3><p class="plan-price">${{ amounts.weekly|intcomma }}<span> {% translate "/ week" %}</span></p><p>{% translate "Put a launch or event in the spotlight." %}</p><a class="plan-button" href="{% url 'sponsor_banner' %}?level=weekly#contact">{% translate "Ask about a week" %} →</a></div>
+      <div><h3>{% translate "One month" %}</h3><p class="plan-price">${{ amounts.monthly|intcomma }}<span> {% translate "/ month" %}</span></p><p>{% translate "Build familiarity with your brand." %}</p><a class="plan-button" href="{% url 'sponsor_banner' %}?level=monthly#contact">{% translate "Ask about a month" %} →</a></div>
+      <p class="sponsor-note">{% translate "Banner sponsorship is booked separately from annual membership. Dates and availability are confirmed with the DSF." %}</p>
+    </div>
+  </section>
+  <section class="sponsor-closing">
+    <h2>{% translate "A stronger framework starts with its people." %}</h2>
+    <p>{% translate "Your support helps fund the Django Fellows, community events, and the work that keeps Django available to everyone." %}</p>
+    <a href="{% url 'contact_foundation' %}">{% translate "Let's find the right fit for your organization" %} →</a>
+    <p><a href="{% url 'fundraising:index' %}">{% translate "Giving as an individual?" %}</a> · <a href="{% url 'members:corporate-members' %}">{% translate "Meet our corporate members" %}</a></p>
+  </section>
+{% endblock content %}

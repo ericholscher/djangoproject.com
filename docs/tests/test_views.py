@@ -1,8 +1,9 @@
 from http import HTTPStatus
+from operator import attrgetter
 
 from django.conf import settings
 from django.contrib.sites.models import Site
-from django.test import SimpleTestCase, TestCase
+from django.test import RequestFactory, SimpleTestCase, TestCase
 from django.urls import reverse, set_urlconf
 from django.utils.translation import activate, gettext as _
 from django_hosts.resolvers import reverse as reverse_with_host
@@ -13,6 +14,7 @@ from releases.models import Release
 from ..models import Document, DocumentRelease
 from ..search import DocumentationCategory
 from ..sitemaps import DocsSitemap
+from ..views import search_results
 
 
 class RedirectsTests(SimpleTestCase):
@@ -89,6 +91,26 @@ class SearchFormTestCase(TestCase):
         self.assertNotContains(response, '<li class="active">')
         # The search result page does not have the Documentation banner.
         self.assertNotContains(response, '<div class="copy-banner">')
+
+    def test_search_paginator_last_page(self):
+        request = RequestFactory().get("/en/5.1/search/?q=generic&page=last")
+        response = search_results(request, "en", 5.1, per_page=2, orphans=1)
+        self.assertContains(response, "5 results for <em>generic</em>", html=True)
+        self.assertContains(response, "Page 2 of 2", html=True)
+        # If orphans are not considered, there would be just two results here.
+        self.assertContains(response, '<h2 class="result-title">', count=3)
+
+    def test_search_paginator_includes_pks_only(self):
+        response = self.client.get(
+            "/en/5.1/search/?q=generic",
+            headers={"host": "docs.djangoproject.localhost:8000"},
+        )
+        self.assertTrue(response.context["page"].object_list)
+        self.assertQuerySetEqual(
+            response.context["page_results"],
+            response.context["page"].object_list,
+            transform=attrgetter("pk"),
+        )
 
     def test_search_type_filter_all(self):
         response = self.client.get(

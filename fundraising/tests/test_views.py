@@ -1,6 +1,9 @@
 import json
+import os
+import random
 from datetime import date, datetime
 from operator import attrgetter
+from unittest import skipUnless
 from unittest.mock import patch
 
 import stripe
@@ -10,9 +13,8 @@ from django.template.defaultfilters import date as date_filter
 from django.test import TestCase
 from django.urls import reverse
 from django_hosts.resolvers import reverse as django_hosts_reverse
-from django_recaptcha.client import RecaptchaResponse
 
-from djangoproject.tests import ReleaseMixin
+from djangoproject.tests import ReleaseMixin, patch_captcha
 from members.models import CorporateMember, Invoice
 
 from ..models import DjangoHero, Donation
@@ -23,6 +25,109 @@ class TestIndex(ReleaseMixin, TestCase):
     def test_redirect(self):
         response = self.client.get(reverse("fundraising:index"))
         self.assertEqual(response.status_code, 200)
+
+    def test_corporate_callout(self):
+        response = self.client.get(reverse("fundraising:index"))
+        self.assertContains(response, 'id="corporate-sponsorship-heading"')
+        self.assertContains(response, 'href="#corporate-sponsorship-heading"')
+        for name in ["sponsor", "sponsor_prospectus_plans"]:
+            with self.subTest(name=name):
+                self.assertContains(response, 'href="%s"' % django_hosts_reverse(name))
+
+
+class TestSponsor(ReleaseMixin, TestCase):
+    def test_sponsor_page(self):
+        response = self.client.get(reverse("sponsor"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Your business runs on Django.")
+        self.assertContains(response, 'id="corporate-membership-tiers"')
+        self.assertContains(response, "$200,000")
+        self.assertContains(response, "$10,000")
+        self.assertContains(response, "$3,000")
+        for slug in ("fellow", "diamond", "platinum", "gold", "silver", "bronze"):
+            url = reverse("sponsor_plan", kwargs={"slug": slug})
+            self.assertContains(response, url)
+            with self.subTest(slug=slug):
+                detail = self.client.get(url)
+                self.assertEqual(detail.status_code, 200)
+                self.assertContains(detail, 'href="#contact"')
+                self.assertContains(detail, reverse("sponsor_prospectus_plans"))
+
+    def test_only_current_sponsors_of_this_plan_are_shown(self):
+        for name, level, expiration in [
+            ("Current Gold Sponsor", 3, date(2099, 1, 1)),
+            ("Expired Gold Sponsor", 3, date(2000, 1, 1)),
+            ("Current Silver Sponsor", 2, date(2099, 1, 1)),
+        ]:
+            member = CorporateMember.objects.create(
+                display_name=name, membership_level=level, url="https://example.com"
+            )
+            Invoice.objects.create(
+                member=member, amount=13750, expiration_date=expiration
+            )
+        response = self.client.get(reverse("sponsor_plan", kwargs={"slug": "gold"}))
+        self.assertContains(response, "Current Gold Sponsor")
+        self.assertNotContains(response, "Expired Gold Sponsor")
+        self.assertNotContains(response, "Current Silver Sponsor")
+        self.assertContains(response, 'id="plan-sponsors-heading"')
+        # The tier has sponsors, so the summary box does not invite a first one.
+        self.assertContains(response, "Your annual investment")
+        self.assertNotContains(response, "Be our first Gold sponsor")
+
+    def test_empty_plan_invites_the_first_sponsor(self):
+        # Nothing to fall back to either, so the invitation stands alone.
+        response = self.client.get(reverse("sponsor_plan", kwargs={"slug": "bronze"}))
+        self.assertContains(response, "Be our first Bronze sponsor")
+        self.assertNotContains(response, 'class="plan-sponsors"')
+        self.assertNotContains(response, "Meet our")
+
+    def test_empty_plan_falls_back_to_the_next_tier_with_sponsors(self):
+        member = CorporateMember.objects.create(
+            display_name="Current Platinum Sponsor",
+            membership_level=4,
+            url="https://example.com",
+        )
+        Invoice.objects.create(
+            member=member, amount=30000, expiration_date=date(2099, 1, 1)
+        )
+        # Nothing at Fellow or Diamond, so both borrow the Platinum sponsors.
+        for slug in ("fellow", "diamond"):
+            with self.subTest(slug=slug):
+                response = self.client.get(
+                    reverse("sponsor_plan", kwargs={"slug": slug})
+                )
+                self.assertContains(response, "Current Platinum Sponsor")
+                self.assertContains(response, "Meet our Platinum sponsors")
+                self.assertNotContains(response, "Meet our Diamond sponsors")
+        response = self.client.get(reverse("sponsor_plan", kwargs={"slug": "fellow"}))
+        self.assertContains(response, "Be our first Fellowship sponsor")
+
+    def test_plan_inquiry_confirmation(self):
+        response = self.client.get(
+            reverse("sponsor_plan_sent", kwargs={"slug": "fellow"})
+        )
+        self.assertContains(
+            response, "Thank you for your interest in Sponsored Fellow sponsorship."
+        )
+        self.assertContains(
+            response, reverse("sponsor_plan", kwargs={"slug": "fellow"})
+        )
+
+    def test_unknown_plan_confirmation(self):
+        response = self.client.get(
+            reverse("sponsor_plan_sent", kwargs={"slug": "unknown"})
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_unknown_plan(self):
+        response = self.client.get(reverse("sponsor_plan", kwargs={"slug": "unknown"}))
+        self.assertEqual(response.status_code, 404)
+
+    def test_prospectus(self):
+        response = self.client.get(reverse("sponsor_prospectus_plans"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "How Investing in Django Makes a Difference")
+        self.assertContains(response, 'id="dsf-social-media-reach"')
 
 
 class TestCampaign(ReleaseMixin, TemporaryMediaRootMixin, TestCase):
@@ -85,6 +190,43 @@ class TestCampaign(ReleaseMixin, TemporaryMediaRootMixin, TestCase):
             html=True,
         )
 
+    def test_corporate_member_with_svg_logo(self):
+        logo = ImageFileFactory("wide.svg", width=10)
+        member = CorporateMember.objects.create(
+            display_name="Test Member", membership_level=1, logo=logo
+        )
+        Invoice.objects.create(amount=100, expiration_date=date.today(), member=member)
+        response = self.client.get(self.index_url)
+
+        self.assertContains(
+            response,
+            """<img
+                src="/m/corporate-members/wide.svg"
+                loading="lazy"
+                alt="Logo of company Test Member"
+            >""",
+            html=True,
+        )
+
+    def test_corporate_member_with_no_thumbnail_logo_available(self):
+        logo = ImageFileFactory("no_thumbnail.png", width=10)
+        member = CorporateMember.objects.create(
+            display_name="Test Member", membership_level=1, logo=logo
+        )
+        Invoice.objects.create(amount=100, expiration_date=date.today(), member=member)
+        with patch("djangoproject.thumbnails.get_thumbnail", side_effect=OSError):
+            response = self.client.get(self.index_url)
+
+        self.assertContains(
+            response,
+            """<img
+                src="/m/corporate-members/no_thumbnail.png"
+                loading="lazy"
+                alt="Logo of company Test Member"
+            >""",
+            html=True,
+        )
+
     def test_anonymous_donor(self):
         hero = DjangoHero.objects.create(
             is_visible=True, approved=True, hero_type="individual"
@@ -120,18 +262,17 @@ class TestCampaign(ReleaseMixin, TemporaryMediaRootMixin, TestCase):
         self.assertFalse(content["success"])
 
     @patch("stripe.checkout.Session.create")
-    @patch("django_recaptcha.fields.client.submit")
-    def test_submitting_donation_form_valid(self, client_submit, session_create):
+    def test_submitting_donation_form_valid(self, session_create):
         session_create.return_value = {"id": "TEST_ID"}
-        client_submit.return_value = RecaptchaResponse(is_valid=True, action="form")
-        response = self.client.post(
-            reverse("fundraising:donation-session"),
-            {
-                "amount": 100,
-                "interval": "onetime",
-                "captcha": "TESTING",
-            },
-        )
+        with patch_captcha():
+            response = self.client.post(
+                reverse("fundraising:donation-session"),
+                {
+                    "amount": 100,
+                    "interval": "onetime",
+                    "captcha": "TESTING",
+                },
+            )
         content = json.loads(response.content.decode())
         self.assertEqual(response.status_code, 200)
         self.assertTrue(content["success"])
@@ -162,6 +303,117 @@ class TestCampaign(ReleaseMixin, TemporaryMediaRootMixin, TestCase):
         response = self.client.post(url, {"donation": donation.id})
         self.assertEqual(response.status_code, 404)
         self.assertFalse(retrieve_customer.called)
+
+
+@skipUnless(
+    os.environ.get("STRIPE_INTEGRATION"),
+    "Set STRIPE_INTEGRATION=1 to run live Stripe integration tests "
+    "(requires a valid test ``stripe_secret_key`` and network access).",
+)
+class TestCheckoutSessionLive(TestCase):
+    """
+    Real end-to-end checkout against the Stripe test (sandbox) API.
+
+    Skipped by default so the suite stays offline and key-free. Each of the
+    site's donation options is exercised with a random amount, which mirrors
+    what the donation form submits. On failure the assertion shows the exact
+    Stripe error the view received, making it easy to reproduce a frontend
+    checkout failure.
+
+    Run with: ``STRIPE_INTEGRATION=1 manage.py test fundraising -k Live``
+    """
+
+    def test_each_donation_option_with_random_amount(self):
+        for interval in settings.PRODUCTS:
+            with self.subTest(interval=interval):
+                amount = random.randint(1, 100)
+                with patch_captcha():
+                    response = self.client.post(
+                        reverse("fundraising:donation-session"),
+                        {
+                            "amount": amount,
+                            "interval": interval,
+                            "captcha": "TESTING",
+                        },
+                    )
+                content = json.loads(response.content.decode())
+                self.assertEqual(response.status_code, 200)
+                if not content["success"]:
+                    self.fail(
+                        f"Stripe rejected the '{interval}' checkout "
+                        f"(amount {amount}): {content['error']}"
+                    )
+                self.assertTrue(content["sessionId"])
+
+
+class TestUpdateCard(ReleaseMixin, TestCase):
+    def setUp(self):
+        self.url = reverse("fundraising:update-card")
+
+    @patch("stripe.Customer.modify")
+    def test_update_card(self, modify_customer):
+        hero = DjangoHero.objects.create(stripe_customer_id="cus_owner")
+        donation = Donation.objects.create(donor=hero, stripe_customer_id="cus_owner")
+        response = self.client.post(
+            self.url,
+            {
+                "hero": hero.pk,
+                "donation_id": donation.id,
+                "stripe_token": "tok_test",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(json.loads(response.content.decode())["success"])
+        modify_customer.assert_called_once_with("cus_owner", source="tok_test")
+
+    @patch("stripe.Customer.modify")
+    def test_update_card_of_another_hero_not_found(self, modify_customer):
+        owner = DjangoHero.objects.create(stripe_customer_id="cus_owner")
+        other = DjangoHero.objects.create(stripe_customer_id="cus_other")
+        donation = Donation.objects.create(donor=owner, stripe_customer_id="cus_owner")
+        response = self.client.post(
+            self.url,
+            {
+                "hero": other.pk,
+                "donation_id": donation.id,
+                "stripe_token": "tok_attacker",
+            },
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(modify_customer.called)
+
+    @patch("stripe.Customer.modify")
+    def test_update_card_without_hero_not_found(self, modify_customer):
+        hero = DjangoHero.objects.create(stripe_customer_id="cus_owner")
+        donation = Donation.objects.create(donor=hero, stripe_customer_id="cus_owner")
+        response = self.client.post(
+            self.url,
+            {"donation_id": donation.id, "stripe_token": "tok_attacker"},
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(modify_customer.called)
+
+    @patch("stripe.Customer.modify")
+    def test_update_card_without_donation_id_not_found(self, modify_customer):
+        hero = DjangoHero.objects.create(stripe_customer_id="cus_owner")
+        Donation.objects.create(donor=hero, stripe_customer_id="cus_owner")
+        response = self.client.post(
+            self.url,
+            {"hero": hero.pk, "stripe_token": "tok_test"},
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(modify_customer.called)
+
+    @patch("stripe.Customer.modify")
+    def test_update_card_without_stripe_token_not_found(self, modify_customer):
+        # A missing token is rejected before any hero/donation lookup, so the
+        # response is a 404 even when hero and donation_id are bogus.
+        response = self.client.post(
+            self.url,
+            {"hero": "nope", "donation_id": "nope"},
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(modify_customer.called)
 
 
 class TestThankYou(ReleaseMixin, TestCase):
@@ -264,8 +516,7 @@ class TestWebhooks(ReleaseMixin, TestCase):
     def stripe_data(self, filename):
         file_path = settings.BASE_DIR / f"fundraising/test_data/{filename}.json"
         with file_path.open() as f:
-            data = json.load(f)
-            return stripe.convert_to_stripe_object(data, stripe.api_key, None)
+            return json.load(f)
 
     def post_event(self, data):
         return self.client.post(

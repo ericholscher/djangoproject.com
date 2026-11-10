@@ -1,6 +1,6 @@
 {% load checklist_extras tz %}
 {% with cves=instance.cves versions=instance.versions cves_length=instance.cves|length %}
-# Django Security Release: {{ versions|enumerate_items }} ({{ when }})
+# Django Security Release: {{ versions|enumerate_items }} ({{ when|utc|date:"N j, Y, P" }} UTC)
 
 ## 14 days before
 
@@ -20,18 +20,18 @@
     - Number of vulnerabilities reported or IDs requested (1-10) info: `{{ cves_length }}`
     - I have verified that this vulnerability is not in a CNA-covered product: `Yes`
     - I have verified that the vulnerability has not already been assigned a CVE ID: `Yes`
-    {% for cve in cves %}{% with releases=cve.releases.all %}
-    - For issue **{{ cve.summary }}**:
+    {% for cve in cves %}{% with affected_ranges=cve.affected_ranges %}
+    - For issue **{{ cve.summary|safe }}**:
         - Vulnerability type info (Other): `{{ cve.cve_type }}`
         {% if cve.other_type %}
         - Other vulnerability type info: `{{ cve.other_type }}`
         {% endif %}
         - Vendor of the product(s) info: `djangoproject`
         - Affected product(s)/code base (SPLIT in product and version (X before Y) in rows!):
-          ```{% for release in releases %}{% if not release.is_pre_release %}
+          ```{% for affected_range in affected_ranges %}
           [row 1] Django
-          [row 2] {{ release|format_release_for_cve }}
-          {% if not forloop.last %}---------- Click [+] Add ----------{% endif %}{% endif %}
+          [row 2] {{ affected_range|format_release_for_cve }}
+          {% if not forloop.last %}---------- Click [+] Add ----------{% endif %}
           {% endfor %}```
         - Has vendor confirmed or acknowledged the vulnerability? `Yes`
         - Attack type info: `{{ cve.attack_type }}`
@@ -68,16 +68,30 @@
     - `git format-patch HEAD~{{ cves_length }}`
     - e.g. https://github.com/django/django-security/pull/375
 
+{% for cve in cves %}
+- [ ] Send patch for **{{ cve.cve_year_number }}** to the reporter ({{ cve.reporters_display }}) for verification:
+    - Subject: `Patch for {{ cve.cve_year_number }}`
+    - Attach patch(es) and send to the reporter with the following body:
+<details>
+<summary>Open for message body</summary>
+```
+{% include "checklists/release-security-reporter-verification.txt" %}
+```
+</details>
+{% endfor %}
+
 ## One Week before
 
 - [ ] Send prenotification email
+    - Reference: https://github.com/django/django-security/wiki/Security-prenotification-email-template
     - Subject: `Notice of upcoming Django security releases ({{ versions|enumerate_items }})`
     - Create a new text file `prenotification-email.txt` with content similar to this:
-        - Reference: https://github.com/django/django-security/wiki/Security-prenotification-email-template
-        - Remove backticks from code symbols
+<details>
+<summary>Open for message body</summary>
 ```
 {% include "checklists/release-security-prenotification.md" %}
 ```
+</details>
 - GPG sign that new file:
     - `gpg --clearsign --digest-algo SHA256 prenotification-email.txt`
     - Send an email with body using the signed content to a given list of special users:
@@ -168,7 +182,7 @@ https://docs.djangoproject.com/en/dev/internals/security/#security-issue-severit
     - Go to https://hackerone.com/bugs?organization_inbox_handle=django_inbox
     - Select the relevant report and close it as `Resolved` with message:
 ```
-This issue was fixed and released on {{ instance.when }}.
+This issue was fixed and released on {{ instance.when|utc|date:"N j, Y" }}.
 
 {{ instance.blogpost_title }}
 

@@ -25,7 +25,8 @@
 
   <form enctype="multipart/form-data" action="" method="post" class="django-hero-form"
         data-stripe-key="{{ stripe_publishable_key }}" data-stripe-icon="{% static 'img/dj-stripe-icon.jpg' %}"
-        data-update-card-url="{% url 'fundraising:update-card' %}">
+        data-update-card-url="{% url 'fundraising:update-card' %}"
+        data-hero="{{ hero.pk }}">
     <h2>{% translate "Manage your participation in the fundraising campaigns" %}</h2>
     <p>{% translate "Information entered below will be visible on all of your donations to the Django Project." %}</p>
     {% csrf_token %}

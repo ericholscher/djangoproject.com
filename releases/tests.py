@@ -15,44 +15,76 @@ from django.utils.safestring import SafeString
 from djangoproject.tests import ReleaseMixin
 from members.models import MEMBERSHIP_LEVELS, PLATINUM_MEMBERSHIP, CorporateMember
 
-from .models import Release, upload_to_artifact, upload_to_checksum
+from .models import Release, get_version, upload_to_artifact, upload_to_checksum
 from .templatetags.date_format import isodate
-from .templatetags.release_notes import get_latest_micro_release, release_notes
+from .templatetags.release_notes import get_latest_release_version, release_notes
+from .utils import (
+    get_django_version_tuple,
+    get_feature_version,
+    get_main_version,
+    get_next_feature_version,
+    get_next_patch_version,
+    get_version_tuple,
+)
 
 
 class TestTemplateTags(TestCase):
-    def test_get_latest_micro_release(self):
+    def test_get_latest_release_version(self):
         Release.objects.create(
             major=1, minor=8, micro=0, is_lts=True, version="1.8", is_active=True
         )
         Release.objects.create(
             major=1, minor=8, micro=1, is_lts=True, version="1.8.1", is_active=True
         )
+        Release.objects.create(
+            major=2028, minor=0, micro=0, is_lts=False, version="2028", is_active=True
+        )
+        Release.objects.create(
+            major=2028, minor=1, micro=0, is_lts=False, version="2028.1", is_active=True
+        )
 
-        self.assertEqual(get_latest_micro_release("1.8"), "1.8.1")
-        self.assertEqual(get_latest_micro_release("1.4"), None)
+        self.assertEqual(get_latest_release_version("1.8"), "1.8.1")
+        self.assertEqual(get_latest_release_version("1.4"), None)
+        self.assertEqual(get_latest_release_version("2028"), "2028.1")
 
-    def test_get_latest_micro_release_excludes_inactive(self):
+    def test_get_latest_release_version_excludes_inactive(self):
         Release.objects.create(major=5, minor=2, micro=0, version="5.2", is_active=True)
         Release.objects.create(
             major=5, minor=2, micro=1, version="5.2.1", is_active=True
+        )
+        Release.objects.create(
+            major=2028, minor=0, micro=0, version="2028", is_active=True
+        )
+        Release.objects.create(
+            major=2028, minor=1, micro=0, version="2028.1", is_active=True
         )
         # Create a newer release that is not yet active.
         Release.objects.create(
             major=5, minor=2, micro=2, version="5.2.2", is_active=False
         )
+        Release.objects.create(
+            major=2028, minor=2, micro=0, version="2028.2", is_active=False
+        )
 
-        self.assertEqual(get_latest_micro_release("5.2"), "5.2.1")
+        self.assertEqual(get_latest_release_version("5.2"), "5.2.1")
+        self.assertEqual(get_latest_release_version("2028"), "2028.1")
 
-    def test_get_latest_micro_release_no_active_releases(self):
+    def test_get_latest_release_version_no_active_releases(self):
         Release.objects.create(
             major=4, minor=1, micro=0, version="4.1", is_active=False
         )
         Release.objects.create(
             major=4, minor=1, micro=1, version="4.1.1", is_active=False
         )
+        Release.objects.create(
+            major=2028, minor=0, micro=0, version="2028", is_active=False
+        )
+        Release.objects.create(
+            major=2028, minor=1, micro=0, version="2028.1", is_active=False
+        )
 
-        self.assertIsNone(get_latest_micro_release("4.1"))
+        self.assertIsNone(get_latest_release_version("4.1"))
+        self.assertIsNone(get_latest_release_version("2028"))
 
     def test_release_notes(self):
         output = release_notes("1.8")
@@ -81,6 +113,30 @@ class TestTemplateTags(TestCase):
             '<a href="http://docs.djangoproject.localhost:8000/en/1.10/releases/1.10/">'
             "1.10 release notes</a>",
         )
+
+    def test_release_notes_calendar_versions(self):
+        cases = [
+            # Version, documentation version, release notes version.
+            ("2028", "2028", "2028"),
+            ("2028.1", "2028", "2028.1"),
+            ("2028.15", "2028", "2028.15"),
+            # Pre-releases don't have their own release notes.
+            ("2028a1", "2028", "2028"),
+            ("2028rc1", "2028", "2028"),
+        ]
+        for version, docs_version, notes_version in cases:
+            with self.subTest(version=version):
+                url = (
+                    f"http://docs.djangoproject.localhost:8000/en/{docs_version}"
+                    f"/releases/{notes_version}/"
+                )
+                output = release_notes(version)
+                self.assertIsInstance(output, SafeString)
+                self.assertEqual(output, f'<a href="{url}">Online documentation</a>')
+                self.assertEqual(
+                    release_notes(version, show_version=True),
+                    f'<a href="{url}">{notes_version} release notes</a>',
+                )
 
     def test_isodate(self):
         self.assertEqual(isodate("2005-07-21"), "July 21, 2005")
@@ -178,22 +234,85 @@ class TestReleaseManager(TestCase):
         lts_versions = Release.objects.lts().values_list("version", flat=True)
         self.assertEqual(list(lts_versions), ["1.8.1", "1.4"])
 
-    def test_current_lts(self):
-        self.assertEqual(Release.objects.current_lts().version, "1.8.1")
-        Release.objects.filter(version="1.8.1").delete()
-        self.assertEqual(Release.objects.current_lts().version, "1.4")
-
-    def test_previous_lts(self):
-        self.assertEqual(Release.objects.previous_lts().version, "1.4")
-        Release.objects.filter(version="1.8.1").delete()
-        self.assertEqual(Release.objects.previous_lts(), None)
-
     def test_preview(self):
         self.assertEqual(Release.objects.preview(), None)
         Release.objects.create(
             version="1.9b2", is_active=True, date=datetime.date.today(), eol_date=None
         )
         self.assertEqual(Release.objects.preview().version, "1.9b2")
+
+
+class CalendarVersionSeriesTestCase(TestCase):
+    today = datetime.date.today()
+    day = datetime.timedelta(days=1)
+
+    def test_unsupported_lists_each_calendar_series_once(self):
+        # A calendar version's minor is its patch number, so grouping series by
+        # (major, minor) would list every patch release of 2028 separately.
+        for version in ["2028", "2028.1", "2028.2"]:
+            Release.objects.create(
+                version=version,
+                is_active=True,
+                date=self.today - 30 * self.day,
+                eol_date=self.today - self.day,
+            )
+        Release.objects.create(
+            version="2029", is_active=True, date=self.today - 10 * self.day
+        )
+
+        unsupported = [release.version for release in Release.objects.unsupported()]
+        self.assertEqual(unsupported, ["2028.2"])
+
+    def test_in_feature_series(self):
+        for version in ["2028", "2028.1", "2028.10", "2029", "6.2", "6.2.1"]:
+            Release.objects.create(version=version, date=self.today)
+        Release.objects.create(version="2028.3a1", date=self.today)
+
+        cases = [
+            ("2028", ["2028.10", "2028.1", "2028"]),
+            ("2028.1", ["2028.10", "2028.1", "2028"]),
+            ("2029", ["2029"]),
+            ("6.2", ["6.2.1", "6.2"]),
+        ]
+        for version, expected in cases:
+            with self.subTest(version=version):
+                release = Release.objects.get(version=version)
+                series = Release.objects.in_feature_series(release)
+                self.assertEqual([r.version for r in series], expected)
+
+    def test_calendar_versions_are_always_lts(self):
+        for version in ["2028a1", "2028", "2028.4", "2030.2"]:
+            with self.subTest(version=version):
+                release = Release.objects.create(
+                    version=version, is_lts=False, date=self.today
+                )
+                self.assertIs(release.is_lts, True)
+                release.refresh_from_db()
+                self.assertIs(release.is_lts, True)
+
+    def test_non_calendar_versions_keep_their_lts_flag(self):
+        for version, is_lts in [("6.1", False), ("6.2", True)]:
+            with self.subTest(version=version):
+                release = Release.objects.create(
+                    version=version, is_lts=is_lts, date=self.today
+                )
+                release.refresh_from_db()
+                self.assertIs(release.is_lts, is_lts)
+
+    def test_calendar_versions_keep_the_flag_but_lose_the_label(self):
+        for version in ["2028a1", "2028", "2028.4"]:
+            with self.subTest(version=version):
+                release = Release.objects.create(version=version, date=self.today)
+                self.assertIs(release.is_lts, True)
+                self.assertIs(release.show_lts_label, False)
+
+    def test_non_calendar_versions_are_labelled_when_lts(self):
+        for version, is_lts in [("6.2", True), ("6.1", False)]:
+            with self.subTest(version=version):
+                release = Release.objects.create(
+                    version=version, is_lts=is_lts, date=self.today
+                )
+                self.assertIs(release.show_lts_label, is_lts)
 
 
 class ReleaseTestCase(TestCase):
@@ -253,6 +372,12 @@ class ReleaseTestCase(TestCase):
             ("5.2b1", "5.2rc1"),
             ("5.2rc1", "5.2"),
             ("5.2", "5.2.1"),
+            ("6.2.6", "2028a1"),
+            ("2028a1", "2028a2"),
+            ("2028a2", "2028b1"),
+            ("2028b1", "2028rc1"),
+            ("2028rc1", "2028"),
+            ("2028", "2028.1"),
         ]
         for previous_version, next_version in cases:
             with self.subTest(msg=f"{previous_version} -> {next_version}"):
@@ -281,11 +406,27 @@ class ReleaseTestCase(TestCase):
             ("1.8rc1", (1, 8, 0, "rc", 1)),
             ("5.2", (5, 2, 0, "final", 0)),
             ("5.2a1", (5, 2, 0, "alpha", 1)),
+            ("2028a1", (2028, 0, 0, "alpha", 1)),
+            ("2028", (2028, 0, 0, "final", 0)),
+            ("2028.1", (2028, 1, 0, "final", 0)),
         ]
         for version, expected in cases:
             with self.subTest(version=version):
                 release = Release.objects.create(version=version)
                 self.assertEqual(release.version_tuple, expected)
+
+    def test_invalid_version(self):
+        # Malformed versions are rejected when saving rather than when parsing,
+        # as get_version_tuple() passes unknown statuses and extra numeric
+        # components through.
+        cases = [
+            ("5.2dev1", KeyError),
+            ("1.2.3.4", ValueError),
+        ]
+        for version, exception in cases:
+            with self.subTest(version=version):
+                with self.assertRaises(exception):
+                    Release.objects.create(version=version)
 
     def test_version_verbose(self):
         cases = [
@@ -295,6 +436,9 @@ class ReleaseTestCase(TestCase):
             ("5.2rc1", "5.2 release candidate 1"),
             ("5.2", "5.2"),
             ("5.2.1", "5.2.1"),
+            ("2028a1", "2028 alpha 1"),
+            ("2028", "2028"),
+            ("2028.1", "2028.1"),
         ]
         for version, expected in cases:
             with self.subTest(version=version):
@@ -308,6 +452,9 @@ class ReleaseTestCase(TestCase):
             ("5.2.1", "5.2"),
             ("5.2.15", "5.2"),
             ("4.1rc1", "4.1"),
+            ("2028rc1", "2028"),
+            ("2028", "2028"),
+            ("2028.1", "2028"),
         ]
         for version, expected in cases:
             with self.subTest(version=version):
@@ -376,6 +523,22 @@ class ReleaseTestCase(TestCase):
                 release = Release.objects.create(version=version)
                 self.assertIs(release.is_pre_release, expected)
 
+    def test_is_calendar_version(self):
+        cases = [
+            ("5.2", False),
+            ("5.2.1", False),
+            ("6.2rc1", False),
+            ("20.0", False),
+            ("2028", True),
+            ("2028a1", True),
+            ("2028.1", True),
+            ("2029.3", True),
+        ]
+        for version, expected in cases:
+            with self.subTest(version=version):
+                release = Release.objects.create(version=version)
+                self.assertIs(release.is_calendar_version, expected)
+
     def test_is_dot_zero(self):
         cases = [
             ("5.2", True),
@@ -384,6 +547,10 @@ class ReleaseTestCase(TestCase):
             ("5.2.15", False),
             ("5.2a1", False),
             ("5.2rc1", False),
+            ("2028", True),
+            ("2030", True),
+            ("2028a1", False),
+            ("2028.1", False),
         ]
         for version, expected in cases:
             with self.subTest(version=version):
@@ -427,6 +594,151 @@ class ReleaseTestCase(TestCase):
         self.assertEqual(hash(r1), hash(r1))
 
 
+class VersionUtilsTestCase(SimpleTestCase):
+    # Every version string Django publishes, and its django.VERSION tuple.
+    # Feature releases from 2028 on are calendar versioned, YYYY[.N], where N
+    # is the patch number and is omitted when zero, as A.B[.C] omits C.
+    cases = [
+        ("1.11", (1, 11, 0, "final", 0)),
+        ("1.11.29", (1, 11, 29, "final", 0)),
+        ("5.2a1", (5, 2, 0, "alpha", 1)),
+        ("5.2b1", (5, 2, 0, "beta", 1)),
+        ("5.2rc1", (5, 2, 0, "rc", 1)),
+        ("5.2", (5, 2, 0, "final", 0)),
+        ("5.2.1", (5, 2, 1, "final", 0)),
+        ("5.2.15", (5, 2, 15, "final", 0)),
+        ("2028a1", (2028, 0, 0, "alpha", 1)),
+        ("2028a2", (2028, 0, 0, "alpha", 2)),
+        ("2028b1", (2028, 0, 0, "beta", 1)),
+        ("2028rc1", (2028, 0, 0, "rc", 1)),
+        ("2028", (2028, 0, 0, "final", 0)),
+        ("2028.1", (2028, 1, 0, "final", 0)),
+        ("2028.15", (2028, 15, 0, "final", 0)),
+        ("2030.2", (2030, 2, 0, "final", 0)),
+    ]
+
+    def test_get_version_tuple(self):
+        for version, expected in self.cases:
+            with self.subTest(version=version):
+                self.assertEqual(get_version_tuple(version), expected)
+
+    def test_get_version(self):
+        for expected, version_tuple in self.cases:
+            with self.subTest(version=expected):
+                self.assertEqual(get_version(version_tuple), expected)
+
+    def test_get_version_from_django_version_tuple(self):
+        # get_version() reads the status from the end of the tuple, so it also
+        # works for the shorter shape django.VERSION uses for calendar
+        # versions.
+        for version, _ in self.cases:
+            with self.subTest(version=version):
+                version_tuple = get_django_version_tuple(version)
+                self.assertEqual(get_version(version_tuple), version)
+
+    def test_version_string_round_trip(self):
+        for version, _ in self.cases:
+            with self.subTest(version=version):
+                self.assertEqual(get_version(get_version_tuple(version)), version)
+
+    def test_get_version_tuple_equivalent_spellings(self):
+        # 2028 and 2028.0 are the same version under PEP 440 (the shorter
+        # release segment is zero padded), so both parse to the same tuple.
+        # Only the shorter spelling is published.
+        for shorter, longer in [("2028", "2028.0"), ("2028a1", "2028.0a1")]:
+            with self.subTest(version=longer):
+                self.assertEqual(get_version_tuple(longer), get_version_tuple(shorter))
+
+    def test_get_version_tuple_invalid_versions(self):
+        # Unknown statuses and extra numeric components are passed through
+        # instead of being rejected here, so it's Release.save() which fails
+        # for them, see ReleaseTestCase.test_invalid_version().
+        cases = [
+            ("5.2dev1", (5, 2, 0, "dev", 1)),
+            ("1.2.3.4", (1, 2, 3, 4, "final", 0)),
+        ]
+        for version, expected in cases:
+            with self.subTest(version=version):
+                self.assertEqual(get_version_tuple(version), expected)
+
+    def test_get_feature_version(self):
+        cases = [
+            ("5.2", "5.2"),
+            ("5.2a1", "5.2"),
+            ("5.2.15", "5.2"),
+            ("1.11.29", "1.11"),
+            ("2028", "2028"),
+            ("2028a1", "2028"),
+            ("2028.15", "2028"),
+        ]
+        for version, expected in cases:
+            with self.subTest(version=version):
+                self.assertEqual(get_feature_version(version), expected)
+
+    def test_get_django_version_tuple(self):
+        # django.VERSION has four components for calendar versions, which have
+        # no minor one, and five for the earlier scheme. See DEP 20.
+        cases = [
+            ("1.11", (1, 11, 0, "final", 0)),
+            ("5.2a1", (5, 2, 0, "alpha", 1)),
+            ("5.2", (5, 2, 0, "final", 0)),
+            ("5.2.15", (5, 2, 15, "final", 0)),
+            ("2028a1", (2028, 0, "alpha", 1)),
+            ("2028rc1", (2028, 0, "rc", 1)),
+            ("2028", (2028, 0, "final", 0)),
+            ("2028.1", (2028, 1, "final", 0)),
+            ("2028.15", (2028, 15, "final", 0)),
+        ]
+        for version, expected in cases:
+            with self.subTest(version=version):
+                self.assertEqual(get_django_version_tuple(version), expected)
+
+    def test_get_next_feature_version(self):
+        cases = [
+            ("5.0", "5.1"),
+            ("5.0.5", "5.1"),
+            ("5.1", "5.2"),
+            ("5.2", "6.0"),
+            ("5.2.9", "6.0"),
+            ("6.0", "6.1"),
+            ("6.1", "6.2"),
+            # 6.2 is the last A.B feature release, followed by 2028.
+            ("6.2", "2028"),
+            ("6.2.6", "2028"),
+            ("6.2rc1", "2028"),
+            ("2028", "2029"),
+            ("2028a1", "2029"),
+            ("2028.15", "2029"),
+            ("2030.2", "2031"),
+        ]
+        for version, expected in cases:
+            with self.subTest(version=version):
+                self.assertEqual(get_next_feature_version(version), expected)
+
+    def test_get_next_patch_version(self):
+        cases = [
+            ("5.2", (5, 2, 1, "alpha", 0)),
+            ("5.2.1", (5, 2, 2, "alpha", 0)),
+            ("5.2.15", (5, 2, 16, "alpha", 0)),
+            ("1.11.29", (1, 11, 30, "alpha", 0)),
+            ("2028", (2028, 1, "alpha", 0)),
+            ("2028.1", (2028, 2, "alpha", 0)),
+            ("2028.15", (2028, 16, "alpha", 0)),
+        ]
+        for version, expected in cases:
+            with self.subTest(version=version):
+                self.assertEqual(get_next_patch_version(version), expected)
+
+    def test_get_next_patch_version_main_version(self):
+        # The next patch version is written to docs and release notes through
+        # its main version, which drops the status and a zero patch number.
+        cases = [("5.2", "5.2.1"), ("5.2.15", "5.2.16"), ("2028", "2028.1")]
+        for version, expected in cases:
+            with self.subTest(version=version):
+                main = get_main_version(get_next_patch_version(version))
+                self.assertEqual(main, expected)
+
+
 class ReleaseUploadToTestCase(SimpleTestCase):
     def test_upload_to_artifact(self):
         for version, filename, expected in [
@@ -456,6 +768,19 @@ class ReleaseUploadToTestCase(SimpleTestCase):
                 "django-5.2b2-py3-none.whl",
                 "releases/5.2/django-5.2b2-py3-none.whl",
             ),
+            # All the releases in a calendar series share a directory.
+            ("2028", "django-2028.tar.gz", "releases/2028/django-2028.tar.gz"),
+            ("2028.1", "django-2028.1.tar.gz", "releases/2028/django-2028.1.tar.gz"),
+            (
+                "2028a1",
+                "django-2028a1.tar.gz",
+                "releases/2028/django-2028a1.tar.gz",
+            ),
+            (
+                "2028.1",
+                "django-2028.1-py3-none.whl",
+                "releases/2028/django-2028.1-py3-none.whl",
+            ),
         ]:
             with self.subTest(version=version, filename=filename):
                 self.assertEqual(
@@ -463,12 +788,34 @@ class ReleaseUploadToTestCase(SimpleTestCase):
                     expected,
                 )
 
+    def test_upload_to_artifact_wrong_release(self):
+        for version, filename in [
+            # A patch release artifact filed under its feature release.
+            ("2028", "django-2028.1.tar.gz"),
+            ("5.2", "django-5.2.1.tar.gz"),
+            # A feature release artifact filed under a patch release.
+            ("2028.1", "django-2028.tar.gz"),
+            ("5.2.1", "django-5.2-py3-none-any.whl"),
+            # A pre-release artifact filed under the final release.
+            ("2028", "django-2028a1.tar.gz"),
+            # Names which don't identify a version at all.
+            ("2028", "tarball.tar.gz"),
+            ("2028", "django-2028.zip"),
+        ]:
+            with self.subTest(version=version, filename=filename):
+                msg = f"Filename {filename} does not belong to the {version} release."
+                with self.assertRaisesMessage(ValidationError, msg):
+                    upload_to_artifact(Release(version=version), filename=filename)
+
     def test_upload_to_checksum(self):
         for version, expected in [
             ("5.2", "pgp/Django-5.2.checksum.txt"),
             ("5.2.1", "pgp/Django-5.2.1.checksum.txt"),
             ("5.2a1", "pgp/Django-5.2a1.checksum.txt"),
             ("5.2b2", "pgp/Django-5.2b2.checksum.txt"),
+            ("2028", "pgp/Django-2028.checksum.txt"),
+            ("2028a1", "pgp/Django-2028a1.checksum.txt"),
+            ("2028.15", "pgp/Django-2028.15.checksum.txt"),
         ]:
             with self.subTest(version=version):
                 self.assertEqual(
@@ -476,6 +823,21 @@ class ReleaseUploadToTestCase(SimpleTestCase):
                     upload_to_checksum(Release(version=version), filename=None),
                     expected,
                 )
+
+
+class ReleaseAdminTestCase(TestCase):
+    def test_is_lts_read_only_for_calendar_versions(self):
+        model_admin = admin.site.get_model_admin(Release)
+        cases = [("6.2", False), ("2028", True), ("2028.4", True)]
+        for version, read_only in cases:
+            with self.subTest(version=version):
+                release = Release.objects.create(version=version)
+                readonly_fields = model_admin.get_readonly_fields(None, release)
+                self.assertIs("is_lts" in readonly_fields, read_only)
+
+    def test_is_lts_editable_when_adding_a_release(self):
+        model_admin = admin.site.get_model_admin(Release)
+        self.assertNotIn("is_lts", model_admin.get_readonly_fields(None, None))
 
 
 class ReleaseAdminFormTestCase(TestCase):
@@ -552,6 +914,11 @@ class ReleaseAdminFormTestCase(TestCase):
             ("wheel", "1.0a1", "django-1.0a1-py3-none-any.whl"),
             ("wheel", "1.0b1", "django-1.0b1-py3-none-any.whl"),
             ("wheel", "1.0rc1", "django-1.0rc1-py3-none-any.whl"),
+            ("tarball", "2028", "django-2028.tar.gz"),
+            ("tarball", "2028a1", "django-2028a1.tar.gz"),
+            ("tarball", "2028.15", "django-2028.15.tar.gz"),
+            ("wheel", "2028", "django-2028-py3-none-any.whl"),
+            ("wheel", "2028.15", "django-2028.15-py3-none-any.whl"),
         ]:
             form = self.form_class(
                 data={"version": version},
@@ -673,6 +1040,100 @@ class ReleaseAdminFormTestCase(TestCase):
         self.test_clearing_also_deletes_file(commit_save=False)
 
 
+class DownloadViewTestCase(ReleaseMixin, TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        today = datetime.date.today()
+        day = datetime.timedelta(1)
+        # The last release of the previous scheme, still supported.
+        cls.previous = Release.objects.create(
+            version="6.2", is_active=True, is_lts=True, date=today - 400 * day
+        )
+        # The feature release, superseded by its first patch release.
+        Release.objects.create(version="2028", is_active=True, date=today - 60 * day)
+        cls.current = Release.objects.create(
+            version="2028.1", is_active=True, date=today - 30 * day
+        )
+        cls.preview = Release.objects.create(
+            version="2029a1", is_active=True, date=today - day
+        )
+
+    def test_current_release(self):
+        response = self.client.get(reverse("download"))
+        self.assertContains(response, "The latest official version is 2028.1.")
+        # The flag is set for calendar versions, but the label is not shown.
+        self.assertIs(self.current.is_lts, True)
+        self.assertNotContains(response, "2028.1 (LTS)")
+        self.assertContains(
+            response,
+            '<a href="http://docs.djangoproject.localhost:8000/en/2028'
+            '/releases/2028.1/">2028.1 release notes</a>',
+            html=True,
+        )
+
+    def test_lts_release_not_listed_twice(self):
+        # 6.2 is the newest LTS release, but it is already listed as the
+        # previous one, so it is not called out again on its own.
+        response = self.client.get(reverse("download"))
+        self.assertIsNone(response.context["lts"])
+        self.assertContains(response, "Django 6.2 (LTS):", count=1)
+
+    def test_lts_label_retired_once_only_calendar_versions_are_supported(self):
+        today = datetime.date.today()
+        day = datetime.timedelta(1)
+        # Two more annual releases, so that the three supported feature
+        # releases DEP 20 keeps at any one time are all calendar versions.
+        for version, age in [("2029", 200), ("2030", 30)]:
+            Release.objects.create(
+                version=version, is_active=True, date=today - age * day
+            )
+
+        response = self.client.get(reverse("download"))
+        # 6.2 is supported still, and the last release the label distinguishes.
+        self.assertEqual(response.context["current"].version, "2030")
+        self.assertEqual(response.context["previous"].version, "2029")
+        self.assertEqual(response.context["lts"], self.previous)
+        self.assertContains(response, "Django 6.2 (LTS):", count=1)
+
+        Release.objects.filter(version="6.2").update(eol_date=today - day)
+
+        response = self.client.get(reverse("download"))
+        self.assertQuerySetEqual(
+            Release.objects.lts(), ["2030", "2029", "2028.1"], transform=str
+        )
+        self.assertIsNone(response.context["lts"])
+        self.assertNotContains(response, "(LTS):")
+
+    def test_preview_release(self):
+        response = self.client.get(reverse("download"))
+        self.assertContains(response, "Get the alpha for 2029")
+        self.assertContains(
+            response,
+            'href="http://www.djangoproject.localhost:8000/download/2029/roadmap/"',
+        )
+        self.assertContains(
+            response,
+            '<a href="http://docs.djangoproject.localhost:8000/en/2029'
+            '/releases/2029/">2029 release notes</a>',
+            html=True,
+        )
+
+    def test_no_supported_release(self):
+        today = datetime.date.today()
+        Release.objects.filter(status="f").update(
+            eol_date=today - datetime.timedelta(1)
+        )
+        response = self.client.get(reverse("download"))
+        self.assertIsNone(response.context["current"])
+        self.assertNotContains(response, "Get the latest official version")
+        # The description falls back to the site-wide one.
+        self.assertNotContains(response, 'content="The latest official version is')
+        # The remaining options close the gap left by the missing section.
+        self.assertContains(response, "Option 1: Get the alpha for 2029")
+        self.assertContains(response, "Option 2: Get the latest development version")
+
+
 class RedirectViewTestCase(TestCase):
     def test_redirect(self):
         Release.objects.create(
@@ -764,10 +1225,13 @@ class CorporateMembersTestCase(ReleaseMixin, TestCase):
 
         response = self.client.get(reverse("download"))
 
-        self.assertContains(response, "<h3>Diamond and Platinum Members</h3>")
-        member_link = (
-            lambda m: f'<a href="{m.url}" title="{m.display_name}">{m.description}</a>'
+        self.assertContains(
+            response, "<h3>Sponsored Fellow, Diamond and Platinum Members</h3>"
         )
+
+        def member_link(m):
+            return f'<a href="{m.url}" title="{m.display_name}">{m.description}</a>'
+
         for member in members:
             if member.membership_level < PLATINUM_MEMBERSHIP:
                 self.assertNotContains(response, member.display_name)
@@ -785,7 +1249,9 @@ class CorporateMembersTestCase(ReleaseMixin, TestCase):
 
         response = self.client.get(reverse("download"))
 
-        self.assertNotContains(response, "<h3>Diamond and Platinum Members</h3>")
+        self.assertNotContains(
+            response, "<h3>Sponsored Fellow, Diamond and Platinum Members</h3>"
+        )
         for member in members:
             self.assertNotContains(response, member.display_name)
             self.assertNotContains(response, member.url)
@@ -793,7 +1259,6 @@ class CorporateMembersTestCase(ReleaseMixin, TestCase):
 
 
 class RoadmapViewTestCase(ReleaseMixin, TestCase):
-
     @classmethod
     def setUpTestData(cls):
         super().setUpTestData()
@@ -816,6 +1281,12 @@ class RoadmapViewTestCase(ReleaseMixin, TestCase):
                 ("b1", datetime.date(2026, 6, 24)),
                 ("rc1", datetime.date(2026, 7, 22)),
                 ("", datetime.date(2026, 8, 5)),  # final
+            ],
+            "2028": [
+                ("a1", datetime.date(2027, 10, 10)),
+                ("b1", datetime.date(2027, 11, 10)),
+                ("rc1", datetime.date(2027, 12, 10)),
+                ("", datetime.date(2028, 1, 10)),  # final
             ],
         }
         for series, milestones in cls.release_schedule.items():
@@ -860,6 +1331,13 @@ class RoadmapViewTestCase(ReleaseMixin, TestCase):
                 response = self.client.get(f"/download/{series}/roadmap/")
                 self.assertEqual(response.status_code, 404)
 
+    def test_series_invalid_format(self):
+        # Only A.B and YYYY series have a roadmap page.
+        for series in ("2028.0", "2028.1", "202", "20280", "1.2.3"):
+            with self.subTest(series=series):
+                response = self.client.get(f"/download/{series}/roadmap/")
+                self.assertEqual(response.status_code, 404)
+
     def test_major_lower_bound(self):
         for minor in (0, 1, 2, 3, 11):
             with self.subTest(minor=minor):
@@ -871,3 +1349,31 @@ class RoadmapViewTestCase(ReleaseMixin, TestCase):
         response = self.client.get(url)
         self.assertContains(response, 'en/dev/internals/contributing/"')
         self.assertContains(response, 'en/dev/internals/release-process/"')
+
+    def test_release_candidate_description_calendar_version(self):
+        url = reverse("roadmap", kwargs={"series": "2028"})
+        response = self.client.get(url)
+        self.assertContains(
+            response,
+            "Django 2028 final will ideally ship in January.",
+        )
+        self.assertNotContains(response, "two weeks after the last RC.")
+
+    def test_release_candidate_description_calendar_version_without_releases(self):
+        # The roadmap is published before any release in the series exists.
+        url = reverse("roadmap", kwargs={"series": "2029"})
+        response = self.client.get(url)
+        self.assertContains(
+            response,
+            "Django 2029 final will ideally ship in January.",
+        )
+        self.assertNotContains(response, "two weeks after the last RC.")
+
+    def test_release_candidate_description_non_calendar_version(self):
+        url = reverse("roadmap", kwargs={"series": "5.2"})
+        response = self.client.get(url)
+        self.assertContains(
+            response,
+            "Django 5.2 final will ideally ship two weeks after the last RC.",
+        )
+        self.assertNotContains(response, "ship in January.")

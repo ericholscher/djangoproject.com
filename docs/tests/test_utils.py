@@ -1,9 +1,43 @@
 import os
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, override_settings
 
-from ..utils import extract_inner_html, get_doc_path, sanitize_for_trigram
+from ..utils import (
+    capture_sentry_exception,
+    extract_inner_html,
+    get_doc_path,
+    purge_docs_html,
+    purge_fastly,
+    sanitize_for_trigram,
+)
+
+
+class CaptureSentryExceptionTests(SimpleTestCase):
+    def test_reports_and_returns_true_when_sentry_available(self):
+        mock_sentry = MagicMock()
+        error = ValueError("something broke")
+        with patch("docs.utils.sentry_sdk", mock_sentry):
+            result = capture_sentry_exception(error)
+        mock_sentry.capture_exception.assert_called_once_with(error)
+        mock_sentry.flush.assert_not_called()
+        self.assertIs(result, True)
+
+    def test_flush_blocks_until_sent(self):
+        mock_sentry = MagicMock()
+        error = ValueError("something broke")
+        with patch("docs.utils.sentry_sdk", mock_sentry):
+            result = capture_sentry_exception(error, flush=True)
+        mock_sentry.capture_exception.assert_called_once_with(error)
+        mock_sentry.flush.assert_called_once()
+        self.assertIs(result, True)
+
+    def test_no_op_and_returns_false_when_sentry_not_installed(self):
+        error = ValueError("something broke")
+        with patch("docs.utils.sentry_sdk", None):
+            result = capture_sentry_exception(error)
+        self.assertIs(result, False)
 
 
 class TestUtils(SimpleTestCase):
@@ -74,3 +108,23 @@ class TestUtils(SimpleTestCase):
     def test_extract_inner_html_tag_not_found_raises(self):
         with self.assertRaisesMessage(ValueError, "<main> not found in HTML."):
             extract_inner_html("<p>Test</p>", tag="main")
+
+
+@override_settings(
+    FASTLY_SERVICE_URL="https://api.fastly.com/service/abc",
+    FASTLY_API_KEY="key",
+)
+@patch("docs.utils.requests.Session.post")
+class PurgeFastlyTests(SimpleTestCase):
+    def test_soft_purge(self, post):
+        post.return_value.json.return_value = {"status": "ok"}
+        purge_fastly("purge/some-key", soft=True)
+        self.assertEqual(
+            post.call_args.args[0], "https://api.fastly.com/service/abc/purge/some-key"
+        )
+        self.assertEqual(post.call_args.kwargs["headers"]["Fastly-Soft-Purge"], "1")
+
+    def test_purge_docs_html_logs_errors(self, post):
+        post.return_value.json.return_value = {"status": "error"}
+        with self.assertLogs("docs.utils", "ERROR"):
+            purge_docs_html()

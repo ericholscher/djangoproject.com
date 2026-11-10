@@ -1,17 +1,39 @@
 import os
+import sys
+import tempfile
 from http import HTTPStatus
 from io import StringIO
+from unittest.mock import patch
 
 from django.conf import settings
 from django.contrib.staticfiles.testing import StaticLiveServerTestCase
 from django.core.management import call_command
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import NoReverseMatch, get_resolver
 from django.utils.translation import activate, gettext as _
 from django_hosts.resolvers import reverse
+from django_recaptcha.client import RecaptchaResponse
 from playwright.sync_api import expect, sync_playwright
 
+from djangoproject.test_runner import selected_browsers
 from docs.models import DocumentRelease, Release
+
+
+def patch_captcha(is_valid=True, score=1.0, extra_data=None, **response_kwargs):
+    """Patch the only reCAPTCHA call that would otherwise reach Google's servers.
+
+    The score defaults to a passing one, so tests that do not care about
+    reCAPTCHA can just wrap their form submission in this context manager.
+    Forms whose widget declares an action must pass a matching ``action``.
+    """
+    extra_data = dict(extra_data or {})
+    extra_data.setdefault("score", score)
+    return patch(
+        "django_recaptcha.fields.client.submit",
+        return_value=RecaptchaResponse(
+            is_valid=is_valid, extra_data=extra_data, **response_kwargs
+        ),
+    )
 
 
 class ReleaseMixin:
@@ -92,6 +114,9 @@ class TemplateViewTests(ReleaseMixin, TestCase):
 
     def test_conduct_changes(self):
         self.assertView("conduct_changes")
+
+    def test_sponsor_banner(self):
+        self.assertView("sponsor_banner")
 
     def test_styleguide(self):
         self.assertView("styleguide")
@@ -234,13 +259,75 @@ class SiteMapTests(TestCase):
         self.assertEqual(response.status_code, 200)
 
 
-class EndToEndTests(ReleaseMixin, StaticLiveServerTestCase):
+class StaticFilesTests(TestCase):
+    @override_settings(
+        STORAGES={
+            "staticfiles": {
+                "BACKEND": "django.contrib.staticfiles.storage.ManifestStaticFilesStorage"
+            }
+        }
+    )
+    def test_collectstatic_with_manifeststaticfilesstorage(self):
+        with tempfile.TemporaryDirectory() as temp_dir_path:
+            with override_settings(STATIC_ROOT=temp_dir_path):
+                try:
+                    call_command("collectstatic", interactive=False, verbosity=0)
+                except ValueError as e:
+                    self.fail(e)
+
+
+class BrowserTestCaseMeta(type(StaticLiveServerTestCase)):
+    """Create one test class per selected browser.
+
+    Rather than every test looping over browsers, the metaclass makes the class
+    browser-specific and adds a subclass per extra browser to the module
+    namespace. Tests keep using ``self.browser`` and need no decoration.
+
+    With no browser selected the tests are skipped rather than defaulting to
+    one, so a run always says which engines it covered.
+    """
+
+    # The browser this class runs against; None on the base class.
+    browser_name = None
+
+    def __new__(cls, name, bases, attrs):
+        test_class = super().__new__(cls, name, bases, attrs)
+        if test_class.browser_name or not any(
+            name.startswith("test") and callable(value) for name, value in attrs.items()
+        ):
+            return test_class
+
+        if not selected_browsers:
+            test_class.__unittest_skip__ = True
+            test_class.__unittest_skip_why__ = (
+                "No browser selected; pass --browser to run the end-to-end tests."
+            )
+            return test_class
+
+        test_class.browser_name = selected_browsers[0]
+        module = sys.modules[test_class.__module__]
+        for browser in selected_browsers[1:]:
+            subclass = super().__new__(
+                cls,
+                f"{browser.capitalize()}{name}",
+                (test_class,),
+                {"browser_name": browser, "__module__": test_class.__module__},
+            )
+            setattr(module, subclass.__name__, subclass)
+        return test_class
+
+
+class EndToEndTests(
+    ReleaseMixin,
+    StaticLiveServerTestCase,
+    metaclass=BrowserTestCaseMeta,
+):
     @classmethod
     def setUpClass(cls):
         os.environ["DJANGO_ALLOW_ASYNC_UNSAFE"] = "true"
         super().setUpClass()
         cls.playwright = sync_playwright().start()
-        cls.browser = cls.playwright.chromium.launch()
+        cls.browser = getattr(cls.playwright, cls.browser_name).launch()
         cls.mac_user_agent = "Mozilla/5.0 (Macintosh) AppleWebKit"
         cls.windows_user_agent = "Mozilla/5.0 (Windows NT 10.0)"
         cls.mobile_linux_user_agent = "Mozilla/5.0 (Linux; Android 10; Mobile)"
@@ -301,10 +388,25 @@ class EndToEndTests(ReleaseMixin, StaticLiveServerTestCase):
         theme = page.evaluate("document.documentElement.dataset.theme")
         self.assertEqual(theme, "dark")
 
-    def test_cycle_theme_when_prefers_dark(self):
+    def open_page_with_color_scheme(self, color_scheme):
+        """
+        Open the site with an emulated OS color scheme.
+
+        The scheme is re-applied after navigating because Firefox drops the
+        emulation when the response carries Cross-Origin-Opener-Policy, which
+        SecurityMiddleware sends by default. Chromium is unaffected.
+
+        Upstream bug, still present in Playwright 1.62 with Firefox 153:
+        https://github.com/microsoft/playwright/issues/33866
+        """
         page = self.browser.new_page(user_agent=self.mac_user_agent)
-        page.emulate_media(color_scheme="dark")
+        page.emulate_media(color_scheme=color_scheme)
         page.goto(self.live_server_url)
+        page.emulate_media(color_scheme=color_scheme)
+        return page
+
+    def test_cycle_theme_when_prefers_dark(self):
+        page = self.open_page_with_color_scheme("dark")
 
         theme = page.evaluate("document.documentElement.dataset.theme")
         self.assertEqual(theme, "auto")
@@ -316,9 +418,7 @@ class EndToEndTests(ReleaseMixin, StaticLiveServerTestCase):
                 self.assertEqual(theme, expected_theme)
 
     def test_cycle_theme_when_prefers_light(self):
-        page = self.browser.new_page(user_agent=self.mac_user_agent)
-        page.emulate_media(color_scheme="light")
-        page.goto(self.live_server_url)
+        page = self.open_page_with_color_scheme("light")
 
         theme = page.evaluate("document.documentElement.dataset.theme")
         self.assertEqual(theme, "auto")

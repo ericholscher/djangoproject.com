@@ -6,17 +6,22 @@ from django.conf import settings
 from django.contrib import messages
 from django.core.mail import send_mail
 from django.forms.models import modelformset_factory
-from django.http import HttpResponse, JsonResponse
+from django.http import Http404, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.template.loader import render_to_string
 from django.urls import reverse
 from django.utils.translation import gettext as _
 from django.views.decorators.cache import never_cache
 from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_POST
+from django.views.decorators.http import require_http_methods, require_POST
+
+from contact.forms import PlanSponsorshipForm
+from members.models import CorporateMember
 
 from .forms import DjangoHeroForm, DonationForm, PaymentForm
 from .models import DjangoHero, Donation, Payment, Testimonial
+from .sponsor_programs import MARKETING_STATS, SPONSORSHIP_AMOUNTS
+from .sponsorship import PLANS
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +35,88 @@ def index(request):
             "testimonial": testimonial,
         },
     )
+
+
+def sponsor(request):
+    return render(
+        request,
+        "fundraising/sponsor.html",
+        {
+            "plans": [
+                {
+                    **plan,
+                    "more_features_count": sum(
+                        len(group["items"]) for group in plan["benefit_groups"]
+                    )
+                    - plan["highlighted_benefit_count"],
+                }
+                for plan in PLANS
+            ],
+            "amounts": SPONSORSHIP_AMOUNTS,
+            "stats": MARKETING_STATS,
+        },
+    )
+
+
+def plan_sponsors(slug):
+    """
+    The sponsors to showcase on a plan page, and the plan they belong to.
+
+    The top tiers have no members yet, so rather than show nothing, fall back
+    down the tiers until one has sponsors. The caller labels the section with
+    the returned plan, not the one being viewed.
+    """
+    by_level = CorporateMember.objects.by_membership_level()
+    slugs = [plan["slug"] for plan in PLANS]
+    start = slugs.index(slug)
+    for plan in PLANS[start:]:
+        key = "sponsored_fellow" if plan["slug"] == "fellow" else plan["slug"]
+        sponsors = by_level.get(key, [])
+        if sponsors:
+            return plan, sponsors
+    return None, []
+
+
+def get_plan_or_404(slug):
+    plan = next((plan for plan in PLANS if plan["slug"] == slug), None)
+    if plan is None:
+        raise Http404("Unknown sponsorship plan")
+    return plan
+
+
+@require_http_methods(["GET", "POST"])
+def sponsor_plan(request, slug):
+    plan = get_plan_or_404(slug)
+    form = PlanSponsorshipForm(
+        data=request.POST if request.method == "POST" else None,
+        request=request,
+        plan=plan,
+    )
+    if request.method == "POST" and form.is_valid():
+        form.save()
+        return redirect("sponsor_plan_sent", slug=slug)
+    sponsors_plan, sponsors = plan_sponsors(slug)
+    return render(
+        request,
+        "sponsor/plan.html",
+        {
+            "plan": plan,
+            "form": form,
+            "stats": MARKETING_STATS,
+            "sponsors": sponsors,
+            "sponsors_plan": sponsors_plan,
+            "plan_has_sponsors": sponsors_plan is plan,
+        },
+    )
+
+
+def sponsor_plan_sent(request, slug):
+    """Confirm a plan inquiry, in place of the generic contact page."""
+    return render(request, "sponsor/plan_sent.html", {"plan": get_plan_or_404(slug)})
+
+
+def sponsor_prospectus(request):
+    return render(request, "fundraising/prospectus.html")
 
 
 @require_POST
@@ -154,11 +241,15 @@ def manage_donations(request, hero):
 
 @require_POST
 def update_card(request):
-    donation = get_object_or_404(Donation, id=request.POST["donation_id"])
+    stripe_token = request.POST.get("stripe_token")
+    if not stripe_token:
+        raise Http404
+    hero = get_object_or_404(DjangoHero, pk=request.POST.get("hero"))
+    donation = get_object_or_404(hero.donation_set, id=request.POST.get("donation_id"))
     try:
         stripe.Customer.modify(
             donation.stripe_customer_id,
-            source=request.POST["stripe_token"],
+            source=stripe_token,
         )
     except stripe.StripeError as e:
         data = {"success": False, "error": str(e)}

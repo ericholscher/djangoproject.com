@@ -5,6 +5,7 @@ from datetime import UTC, date, datetime
 
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError
+from django.db.models import ProtectedError
 from django.template.loader import render_to_string
 from django.test import RequestFactory, TestCase, override_settings
 from django.urls import reverse
@@ -20,6 +21,7 @@ from checklists.models import (
     SecurityIssueReleasesThrough,
     SecurityRelease,
     get_cvss_severity,
+    get_unsupported_series_default,
 )
 from checklists.tests.factory import Factory
 
@@ -353,6 +355,81 @@ class SecurityReleaseChecklistTestCase(BaseChecklistTestCaseMixin, TestCase):
             ["CVE-2025-9999", "CVE-2025-10000", "CVE-2025-9999", "CVE-2025-10000"],
         )
 
+    def test_render_checklist_reporter_patch_notification(self):
+        release = self.factory.make_release(version="5.2.1")
+        when = datetime(2025, 6, 4, 14, 0, tzinfo=UTC)
+        checklist = self.make_checklist(releases=[], when=when)
+        self.factory.make_security_issue(
+            checklist,
+            [release],
+            cve_year_number="CVE-2025-11111",
+            reporter="Alice Smith",
+            summary="Potential exposure via missing `Vary: Authorization` header",
+        )
+        checklist_content = self.do_render_checklist(checklist)
+
+        with self.subTest(task="Subject contains CVE ID but not summary"):
+            self.assertInChecklistContent(
+                "Subject: `Patch for CVE-2025-11111`", checklist_content
+            )
+
+        with self.subTest(task="Patch notification item present in 10-days section"):
+            ten_days_pos = checklist_content.find("## 10 days before")
+            one_week_pos = checklist_content.find("## One Week before")
+            notification_pos = checklist_content.find(
+                "Send patch for **CVE-2025-11111** to the reporter (Alice Smith)"
+            )
+            self.assertGreater(notification_pos, ten_days_pos)
+            self.assertLess(notification_pos, one_week_pos)
+
+        with self.subTest(task="Planned release date appears"):
+            self.assertInChecklistContent("June 4, 2025", checklist_content)
+
+        with self.subTest(task="Announcement channels are listed"):
+            self.assertInChecklistContent(
+                "https://groups.google.com/g/django-announce/", checklist_content
+            )
+            self.assertInChecklistContent(
+                "https://forum.djangoproject.com/tags/c/announcements/releases/31/"
+                "security/",
+                checklist_content,
+            )
+
+        with self.subTest(task="Privacy reminder present"):
+            self.assertInChecklistContent(
+                "keep this information\nprivate", checklist_content
+            )
+
+    def test_render_checklist_reporter_patch_notification_multiple_cves(self):
+        release = self.factory.make_release(version="5.2.1")
+        checklist = self.make_checklist(
+            releases=[], when=datetime(2025, 6, 4, tzinfo=UTC)
+        )
+        self.factory.make_security_issue(
+            checklist,
+            [release],
+            cve_year_number="CVE-2025-11111",
+            reporter="Alice Smith",
+        )
+        self.factory.make_security_issue(
+            checklist,
+            [release],
+            cve_year_number="CVE-2025-22222",
+            reporter="Bob Jones",
+        )
+        checklist_content = self.do_render_checklist(checklist)
+
+        one_week_pos = checklist_content.find("## One Week before")
+        verification_pos = checklist_content.find("Send patch for")
+        notification_section = checklist_content[verification_pos:one_week_pos]
+        for cve, reporter in [
+            ("CVE-2025-11111", "Alice Smith"),
+            ("CVE-2025-22222", "Bob Jones"),
+        ]:
+            with self.subTest(cve=cve):
+                self.assertIn(cve, notification_section)
+                self.assertIn(reporter, notification_section)
+
     def test_render_checklist_simple(self):
         checklist = self.make_checklist()
         checklist_content = self.do_render_checklist(checklist)
@@ -460,6 +537,64 @@ class SecurityReleaseChecklistTestCase(BaseChecklistTestCaseMixin, TestCase):
         )
         self.assertIn(f"Get CVE Record from {expected_url}", checklist_content)
 
+    def test_render_checklist_introduced_in(self):
+        release = self.factory.make_release(version="6.0.10")
+        checklist = self.make_checklist(releases=[release])
+        SecurityIssueReleasesThrough.objects.filter(release=release).update(
+            introduced_in=self.factory.make_release(version="6.0.4")
+        )
+
+        checklist_content = self.do_render_checklist(checklist)
+
+        self.assertInChecklistContent(
+            "[row 1] Django [row 2] 6.0.4 before 6.0.10", checklist_content, flat=True
+        )
+        self.assertInChecklistContent(
+            "An issue was discovered in Django 6.0.4 before 6.0.10.", checklist_content
+        )
+
+    def test_render_checklist_some_cves_not_affected_in_all_versions(self):
+        release1 = self.factory.make_release(version="5.2.20")
+        release2 = self.factory.make_release(version="6.0.a1")
+        checklist = self.factory.make_checklist(SecurityRelease)
+        # This issue does not affect 5.2.x.
+        self.factory.make_security_issue(
+            checklist, cve_year_number="CVE-2026-0001", releases=[release2]
+        )
+        self.factory.make_security_issue(
+            checklist, cve_year_number="CVE-2026-0002", releases=[release1, release2]
+        )
+
+        checklist_content = self.do_render_checklist(checklist)
+        phase_0_content = checklist_content.split("Phase 0")[1].split("Phase 1")[0]
+
+        self.assertEqual(
+            re.findall(
+                r"^#### For .+|Apply patch for \*\*CVE-\d{4}-\d+",
+                phase_0_content,
+                re.MULTILINE,
+            ),
+            [
+                "#### For `main`",
+                "Apply patch for **CVE-2026-0001",
+                "Apply patch for **CVE-2026-0002",
+                "#### For 6.0.a1 (at pre-release alpha status)",
+                "Apply patch for **CVE-2026-0001",
+                "Apply patch for **CVE-2026-0002",
+                "#### For 5.2.20",
+                "Apply patch for **CVE-2026-0002",
+            ],
+        )
+        self.assertInChecklistContent(
+            "path/to/patch/for/5.2.20/0001-CVE-2026-0002.patch", checklist_content
+        )
+        self.assertInChecklistContent(
+            "path/to/patch/for/6.0.a1/0001-CVE-2026-0001.patch", checklist_content
+        )
+        self.assertInChecklistContent(
+            "path/to/patch/for/6.0.a1/0002-CVE-2026-0002.patch", checklist_content
+        )
+
     def test_render_checklist_blogdescription_display(self):
         checklist = self.make_checklist(releases=[])
         blog = (
@@ -516,7 +651,7 @@ class SecurityReleaseChecklistTestCase(BaseChecklistTestCaseMixin, TestCase):
             checklist,
             releases,
             cve_year_number="CVE-2025-22222",
-            summary="Denial-of-service in `LoginView` and `LogoutView`",
+            summary='DoS in `LoginView` and `LogoutView` for "superusers"',
         )
         checklist_content = self.do_render_checklist(checklist)
 
@@ -524,8 +659,8 @@ class SecurityReleaseChecklistTestCase(BaseChecklistTestCaseMixin, TestCase):
         expected_md = [
             "## CVE-2025-11111: Denial-of-service possibility in `strip_tags()`\n",
             "### CVE-2025-11111: Denial-of-service possibility in `strip_tags()`\n",
-            "## CVE-2025-22222: Denial-of-service in `LoginView` and `LogoutView`\n",
-            "### CVE-2025-22222: Denial-of-service in `LoginView` and `LogoutView`\n",
+            '## CVE-2025-22222: DoS in `LoginView` and `LogoutView` for "superusers"\n',
+            '### CVE-2025-22222: DoS in `LoginView` and `LogoutView` for "superusers"\n',
         ]
         for headline in expected_md:
             with self.subTest(headline=headline):
@@ -539,7 +674,7 @@ class SecurityReleaseChecklistTestCase(BaseChecklistTestCaseMixin, TestCase):
             f"`Full description\n<{checklist.blogpost_link}>`__",
             "May 7, 2025 - :cve:`2025-22222`\n"
             "-------------------------------\n\n"
-            "Denial-of-service in ``LoginView`` and ``LogoutView``.\n"
+            'DoS in ``LoginView`` and ``LogoutView`` for "superusers".\n'
             f"`Full description\n<{checklist.blogpost_link}>`__",
         ]
         for headline in expected_rst:
@@ -573,6 +708,8 @@ class SecurityReleaseChecklistTestCase(BaseChecklistTestCaseMixin, TestCase):
             description=cve_description,
             reporter=reporter,
             discovery="INTERNAL",
+            commit_hash_main="1234567",
+            unsupported_series="5.0.x, 4.1.x, and 3.2.x",
         )
         checklist_content = self.do_render_checklist(checklist)
 
@@ -634,21 +771,25 @@ class SecurityReleaseChecklistTestCase(BaseChecklistTestCaseMixin, TestCase):
                 "url": "https://groups.google.com/g/django-announce",
             },
             {
+                "tags": ["patch"],
+                "url": "https://github.com/django/django/commit/1234567",
+            },
+            {
                 "name": "Django security releases issued: 5.1.8 and 5.0.14",
                 "tags": ["vendor-advisory"],
                 "url": checklist.blogpost_link,
             },
         ]
         expected_description = (
-            "An issue was discovered in 5.0 before 5.0.14 and 5.1 before 5.1.8.\n"
+            "An issue was discovered in Django 5.1 before 5.1.8 and 5.0 before 5.0.14.\n"
             f"{cve_description}\n"
             "Earlier, unsupported Django series (such as 5.0.x, 4.1.x, and 3.2.x) "
             "were not evaluated and may also be affected.\n"
             f"Django would like to thank {reporter} for reporting this issue."
         )
         expected_html_description = (
-            "<p>An issue was discovered in 5.0 before 5.0.14 and 5.1 before 5.1.8.</p>"
-            f"<p>{cve_description}</p>"
+            "<p>An issue was discovered in Django 5.1 before 5.1.8 and 5.0 before "
+            f"5.0.14.</p><p>{cve_description}</p>"
             "<p>Earlier, unsupported Django series (such as 5.0.x, 4.1.x, and 3.2.x) "
             "were not evaluated and may also be affected.</p>"
             f"<p>Django would like to thank {reporter} for reporting this issue.</p>"
@@ -776,6 +917,150 @@ class SecurityReleaseChecklistTestCase(BaseChecklistTestCaseMixin, TestCase):
             },
         )
 
+    def test_cve_data_credits_one_entry_per_person(self):
+        release = self.factory.make_release(version="5.2.1")
+        checklist = self.make_checklist(releases=[])
+        issue = self.factory.make_security_issue(
+            checklist,
+            [release],
+            reporter="Alice Reporter, Bob Reporter , Carol Reporter",
+            analyst="Frank Analyst",
+            remediator="Dan Fixer,Erin Fixer",
+            reviewer="Grace Reviewer, Heidi Reviewer",
+        )
+
+        self.assertEqual(
+            issue.cve_data["credits"],
+            [
+                {"lang": "en", "type": "reporter", "value": "Alice Reporter"},
+                {"lang": "en", "type": "reporter", "value": "Bob Reporter"},
+                {"lang": "en", "type": "reporter", "value": "Carol Reporter"},
+                {"lang": "en", "type": "analyst", "value": "Frank Analyst"},
+                {"lang": "en", "type": "remediation developer", "value": "Dan Fixer"},
+                {"lang": "en", "type": "remediation developer", "value": "Erin Fixer"},
+                {
+                    "lang": "en",
+                    "type": "remediation reviewer",
+                    "value": "Grace Reviewer",
+                },
+                {
+                    "lang": "en",
+                    "type": "remediation reviewer",
+                    "value": "Heidi Reviewer",
+                },
+                {
+                    "lang": "en",
+                    "type": "coordinator",
+                    "value": checklist.releaser.user.get_full_name(),
+                },
+            ],
+        )
+
+    def test_cve_data_credits_omits_blank_roles(self):
+        release = self.factory.make_release(version="5.2.1")
+        checklist = self.make_checklist(releases=[])
+        issue = self.factory.make_security_issue(
+            checklist,
+            [release],
+            reporter="",
+            analyst="",
+            remediator=" , ",
+            reviewer="",
+        )
+
+        self.assertEqual(
+            issue.cve_data["credits"],
+            [
+                {
+                    "lang": "en",
+                    "type": "coordinator",
+                    "value": checklist.releaser.user.get_full_name(),
+                },
+            ],
+        )
+
+    def test_credit_names_ignore_blanks_and_whitespace(self):
+        issue = self.factory.make_security_issue(
+            reporter="  Alice Reporter ,, Bob Reporter  ",
+            analyst="",
+            remediator=" , ",
+            reviewer="Grace Reviewer",
+        )
+
+        self.assertEqual(issue.reporters, ["Alice Reporter", "Bob Reporter"])
+        self.assertEqual(issue.analysts, [])
+        self.assertEqual(issue.remediators, [])
+        self.assertEqual(issue.reviewers, ["Grace Reviewer"])
+        self.assertEqual(issue.reporters_display, "Alice Reporter and Bob Reporter")
+        self.assertEqual(issue.remediators_display, "")
+
+    def test_cve_description_omits_thanks_when_no_reporters(self):
+        release = self.factory.make_release(version="5.2.1")
+        checklist = self.make_checklist(releases=[])
+        issue = self.factory.make_security_issue(checklist, [release], reporter=" , ")
+
+        self.assertNotIn("would like to thank", issue.cve_description)
+        self.assertNotIn("would like to thank", issue.cve_html_description)
+
+    def test_cve_description_enumerates_reporters(self):
+        release = self.factory.make_release(version="5.2.1")
+        checklist = self.make_checklist(releases=[])
+        issue = self.factory.make_security_issue(
+            checklist,
+            [release],
+            reporter="Alice Reporter, Bob Reporter, Carol Reporter",
+        )
+
+        self.assertIn(
+            "Django would like to thank Alice Reporter, Bob Reporter, and "
+            "Carol Reporter for reporting this issue.",
+            issue.cve_description,
+        )
+
+    def test_cve_html_description_converts_backticks_to_code_tags(self):
+        release = self.factory.make_release(version="5.2.1")
+        checklist = self.make_checklist(releases=[])
+        issue = self.factory.make_security_issue(
+            checklist,
+            [release],
+            description=(
+                "The `vulnerable_method()` is subject to an attack via `user_input`."
+            ),
+        )
+        html = issue.cve_html_description
+        self.assertIn("<code>vulnerable_method()</code>", html)
+        self.assertIn("<code>user_input</code>", html)
+        self.assertNotIn("`vulnerable_method()`", html)
+        self.assertNotIn("`user_input`", html)
+
+    def test_cve_description_includes_unsupported_series_note(self):
+        release = self.factory.make_release(version="5.2.1")
+        checklist = self.make_checklist(releases=[])
+        issue = self.factory.make_security_issue(
+            checklist, [release], unsupported_series="5.0.x, 4.1.x, and 3.2.x"
+        )
+
+        note = (
+            "Earlier, unsupported Django series (such as 5.0.x, 4.1.x, and "
+            "3.2.x) were not evaluated and may also be affected."
+        )
+        self.assertIn(note, issue.cve_description)
+        self.assertIn(f"<p>{note}</p>", issue.cve_html_description)
+
+    def test_cve_description_omits_unsupported_series_note_when_blank(self):
+        release = self.factory.make_release(version="5.2.1")
+        checklist = self.make_checklist(releases=[])
+        issue = self.factory.make_security_issue(
+            checklist, [release], unsupported_series=""
+        )
+
+        self.assertNotIn(
+            "were not evaluated and may also be affected", issue.cve_description
+        )
+        self.assertNotIn(
+            "were not evaluated and may also be affected", issue.cve_html_description
+        )
+
     def test_hashes_by_branch(self):
         releases = [
             self.factory.make_release(version="5.0.14"),
@@ -850,6 +1135,185 @@ class SecurityIssueReleaseThroughTestCase(TestCase):
         self.assertEqual(through1.commit_hash, "")
         self.assertEqual(through2.commit_hash, "")
 
+    def test_introduced_in_must_be_in_same_series(self):
+        release = self.factory.make_release(version="6.0.10")
+        other_series = self.factory.make_release(version="5.2.13")
+        issue = self.factory.make_security_issue(releases=[release])
+        through = SecurityIssueReleasesThrough.objects.get(
+            securityissue=issue, release=release
+        )
+        through.introduced_in = other_series
+        with self.assertRaisesMessage(
+            ValidationError, "Must be a release in the same series as release."
+        ):
+            through.full_clean()
+
+    def test_introduced_in_must_be_a_final_release(self):
+        release = self.factory.make_release(version="6.0.10")
+        issue = self.factory.make_security_issue(releases=[release])
+        through = SecurityIssueReleasesThrough.objects.get(
+            securityissue=issue, release=release
+        )
+        through.introduced_in = self.factory.make_release(version="6.0rc1")
+        with self.assertRaisesMessage(ValidationError, "Must be a final release."):
+            through.full_clean()
+
+    def test_introduced_in_must_be_older_than_release(self):
+        release = self.factory.make_release(version="6.0.10")
+        issue = self.factory.make_security_issue(releases=[release])
+        through = SecurityIssueReleasesThrough.objects.get(
+            securityissue=issue, release=release
+        )
+        newer = self.factory.make_release(version="6.0.11")
+        for introduced_in in [release, newer]:
+            with self.subTest(introduced_in=introduced_in.version):
+                through.introduced_in = introduced_in
+                with self.assertRaisesMessage(
+                    ValidationError, "Must be older than release."
+                ):
+                    through.full_clean()
+
+    def test_introduced_in_valid(self):
+        release = self.factory.make_release(version="6.0.10")
+        issue = self.factory.make_security_issue(releases=[release])
+        through = SecurityIssueReleasesThrough.objects.get(
+            securityissue=issue, release=release
+        )
+        through.introduced_in = self.factory.make_release(version="6.0.4")
+        through.full_clean()
+
+    def test_cve_data_affected_versions_use_introduced_in(self):
+        releases = [
+            self.factory.make_release(version="6.1.3"),
+            self.factory.make_release(version="6.0.10"),
+            self.factory.make_release(version="5.2.19"),
+        ]
+        issue = self.factory.make_security_issue(releases=releases)
+        SecurityIssueReleasesThrough.objects.filter(
+            securityissue=issue, release=releases[1]
+        ).update(introduced_in=self.factory.make_release(version="6.0.4"))
+        SecurityIssueReleasesThrough.objects.filter(
+            securityissue=issue, release=releases[2]
+        ).update(introduced_in=self.factory.make_release(version="5.2.13"))
+
+        self.assertEqual(
+            issue.cve_data["affected"][0]["versions"],
+            [
+                {
+                    "status": "affected",
+                    "version": "6.1",
+                    "lessThan": "6.1.3",
+                    "versionType": "python",
+                },
+                {"status": "unaffected", "version": "6.1.3", "versionType": "python"},
+                {
+                    "status": "unaffected",
+                    "version": "6.0",
+                    "lessThan": "6.0.4",
+                    "versionType": "python",
+                },
+                {
+                    "status": "affected",
+                    "version": "6.0.4",
+                    "lessThan": "6.0.10",
+                    "versionType": "python",
+                },
+                {"status": "unaffected", "version": "6.0.10", "versionType": "python"},
+                {
+                    "status": "unaffected",
+                    "version": "5.2",
+                    "lessThan": "5.2.13",
+                    "versionType": "python",
+                },
+                {
+                    "status": "affected",
+                    "version": "5.2.13",
+                    "lessThan": "5.2.19",
+                    "versionType": "python",
+                },
+                {"status": "unaffected", "version": "5.2.19", "versionType": "python"},
+            ],
+        )
+
+    def test_cve_description_uses_introduced_in(self):
+        releases = [
+            self.factory.make_release(version="6.0.10"),
+            self.factory.make_release(version="5.2.19"),
+        ]
+        issue = self.factory.make_security_issue(releases=releases)
+        SecurityIssueReleasesThrough.objects.filter(
+            securityissue=issue, release=releases[0]
+        ).update(introduced_in=self.factory.make_release(version="6.0.4"))
+
+        self.assertIn(
+            "An issue was discovered in Django 6.0.4 before 6.0.10 and 5.2 "
+            "before 5.2.19.",
+            issue.cve_description,
+        )
+
+    def test_affected_ranges_ordered_by_version_components(self):
+        # A string sort puts "6.2.7" above "2029.1", and "6.0.9" above "6.0.10".
+        releases = [
+            self.factory.make_release(version="6.2.7"),
+            self.factory.make_release(version="2029.1"),
+            self.factory.make_release(version="2028.4"),
+            self.factory.make_release(version="6.0.9"),
+            self.factory.make_release(version="6.0.10"),
+        ]
+        issue = self.factory.make_security_issue(releases=releases)
+
+        self.assertEqual(
+            [r.release.version for r in issue.affected_ranges],
+            ["2029.1", "2028.4", "6.2.7", "6.0.10", "6.0.9"],
+        )
+
+    def test_affected_ranges_exclude_pre_releases(self):
+        releases = [
+            self.factory.make_release(version="6.1.3"),
+            self.factory.make_release(version="6.2a1"),
+        ]
+        issue = self.factory.make_security_issue(releases=releases)
+
+        self.assertEqual([r.release.version for r in issue.affected_ranges], ["6.1.3"])
+
+    def test_cve_data_introduced_in_feature_release(self):
+        release = self.factory.make_release(version="6.0.10")
+        issue = self.factory.make_security_issue(releases=[release])
+        SecurityIssueReleasesThrough.objects.filter(
+            securityissue=issue, release=release
+        ).update(introduced_in=self.factory.make_release(version="6.0"))
+
+        self.assertEqual(
+            issue.cve_data["affected"][0]["versions"],
+            [
+                {
+                    "status": "affected",
+                    "version": "6.0",
+                    "lessThan": "6.0.10",
+                    "versionType": "python",
+                },
+                {"status": "unaffected", "version": "6.0.10", "versionType": "python"},
+            ],
+        )
+
+    def test_affected_release_cannot_be_deleted(self):
+        release = self.factory.make_release(version="6.0.10")
+        self.factory.make_security_issue(releases=[release])
+
+        with self.assertRaises(ProtectedError):
+            release.delete()
+
+    def test_introduced_in_release_cannot_be_deleted(self):
+        release = self.factory.make_release(version="6.0.10")
+        introduced_in = self.factory.make_release(version="6.0.4")
+        issue = self.factory.make_security_issue(releases=[release])
+        SecurityIssueReleasesThrough.objects.filter(
+            securityissue=issue, release=release
+        ).update(introduced_in=introduced_in)
+
+        with self.assertRaises(ProtectedError):
+            introduced_in.delete()
+
 
 class GetCvssSeverityTests(TestCase):
     def test_none_for_null_score(self):
@@ -875,7 +1339,42 @@ class GetCvssSeverityTests(TestCase):
         self.assertEqual(get_cvss_severity(10.0), "CRITICAL")
 
 
+class GetDefaultUnsupportedSeriesTests(TestCase):
+    factory = Factory()
+
+    def make_eol_release(self, version, eol_date):
+        return self.factory.make_release(
+            version=version, date=date(2015, 1, 1), eol_date=eol_date, is_active=True
+        )
+
+    def test_empty_when_no_unsupported_releases(self):
+        self.assertEqual(get_unsupported_series_default(), "")
+
+    def test_lists_three_most_recent_eol_series(self):
+        self.make_eol_release("3.2.25", date(2024, 4, 1))
+        self.make_eol_release("4.1.13", date(2024, 12, 1))
+        self.make_eol_release("5.0.14", date(2025, 4, 1))
+        # Older series that must not appear (only 3 most recent are listed).
+        self.make_eol_release("2.2.28", date(2022, 4, 1))
+
+        self.assertEqual(get_unsupported_series_default(), "5.0.x, 4.1.x, and 3.2.x")
+
+    def test_uses_latest_micro_per_series(self):
+        self.make_eol_release("4.1.13", date(2024, 12, 1))
+        self.make_eol_release("4.1.7", date(2024, 12, 1))
+
+        self.assertEqual(get_unsupported_series_default(), "4.1.x")
+
+
 class SecurityIssueTestCase(TestCase):
+    factory = Factory()
+
+    def test_security_release_cannot_be_deleted(self):
+        checklist = self.factory.make_security_checklist()
+
+        with self.assertRaises(ProtectedError):
+            checklist.delete()
+
     def test_cve_year_number_invalid(self):
         invalid_cve_numbers = [
             "CVE-2026-1",
@@ -918,6 +1417,9 @@ class CvssMetricsInCveDataTests(TestCase):
     def _make_issue(self, **kwargs):
         checklist = self.factory.make_security_checklist(releases=[])
         return self.factory.make_security_issue(checklist, **kwargs)
+
+    def _get_cna(self, issue):
+        return issue.cve_data["containers"]["cna"]
 
     def _get_metrics(self, issue):
         return issue.cve_data["metrics"]
@@ -997,6 +1499,62 @@ class CvssMetricsInCveDataTests(TestCase):
         self.assertEqual(len(metrics), 1)
         self.assertNotIn("cvssV4_0", metrics[0])
 
+    def test_single_cwe(self):
+        issue = self._make_issue(
+            cna="DSF",
+            cve_type="CWE-347: Improper Verification of Cryptographic Signature",
+        )
+        descriptions = self._get_cna(issue)["problemTypes"][0]["descriptions"]
+        self.assertEqual(len(descriptions), 1)
+        self.assertEqual(descriptions[0]["cweId"], "CWE-347")
+        self.assertEqual(
+            descriptions[0]["description"],
+            "CWE-347: Improper Verification of Cryptographic Signature",
+        )
+
+    def test_multiple_cwes(self):
+        issue = self._make_issue(
+            cna="DSF",
+            cve_type="CWE-347: Improper Verification of Signature, CWE-89: SQL Injection",
+        )
+        descriptions = self._get_cna(issue)["problemTypes"][0]["descriptions"]
+        self.assertEqual(len(descriptions), 2)
+        self.assertEqual(descriptions[0]["cweId"], "CWE-347")
+        self.assertEqual(
+            descriptions[0]["description"],
+            "CWE-347: Improper Verification of Signature",
+        )
+        self.assertEqual(descriptions[1]["cweId"], "CWE-89")
+        self.assertEqual(descriptions[1]["description"], "CWE-89: SQL Injection")
+
+    def test_single_capec(self):
+        issue = self._make_issue(
+            cna="DSF",
+            impact="CAPEC-475: Signature Spoofing by Improper Validation",
+        )
+        impacts = self._get_cna(issue)["impacts"]
+        self.assertEqual(len(impacts), 1)
+        self.assertEqual(impacts[0]["capecId"], "CAPEC-475")
+        self.assertEqual(
+            impacts[0]["descriptions"][0]["value"],
+            "CAPEC-475: Signature Spoofing by Improper Validation",
+        )
+
+    def test_multiple_capecs(self):
+        issue = self._make_issue(
+            cna="DSF",
+            impact="CAPEC-475: Spoofing by Improper Validation, CAPEC-62: CSRF",
+        )
+        impacts = self._get_cna(issue)["impacts"]
+        self.assertEqual(len(impacts), 2)
+        self.assertEqual(impacts[0]["capecId"], "CAPEC-475")
+        self.assertEqual(
+            impacts[0]["descriptions"][0]["value"],
+            "CAPEC-475: Spoofing by Improper Validation",
+        )
+        self.assertEqual(impacts[1]["capecId"], "CAPEC-62")
+        self.assertEqual(impacts[1]["descriptions"][0]["value"], "CAPEC-62: CSRF")
+
 
 class PreReleaseChecklistTestCase(BaseChecklistTestCaseMixin, TestCase):
     checklist_class = PreRelease
@@ -1036,6 +1594,10 @@ class PreReleaseChecklistTestCase(BaseChecklistTestCaseMixin, TestCase):
                     f"upcoming Django 6.0 release, is available."
                 )
                 self.assertEqual(checklist.blogpost_summary, expected)
+                self.assertIn(
+                    f"60-{checklist.status_reversed}-1-released/",
+                    checklist.blogpost_link,
+                )
 
     def test_versions(self):
         feature_release = self.factory.make_feature_release_checklist("6.0")
@@ -1078,6 +1640,36 @@ class PreReleaseChecklistTestCase(BaseChecklistTestCaseMixin, TestCase):
 
                 final_version_correct = f"Django 5.2 {version} 1 is now available."
                 self.assertIn(final_version_correct, checklist_content)
+
+    def test_render_checklist_calendar_version_schedule(self):
+        # Under DEP 20 the pre-releases are a month apart, and the final
+        # release follows the release candidate by a month, not two weeks.
+        feature_release = self.factory.make_feature_release_checklist("2028")
+        cases = {
+            "b": "scheduled roughly a month later on",
+            "rc": "can't be solved in the next\nmonth",
+        }
+        for status, expected in cases.items():
+            release = self.factory.make_release(
+                version=f"2028{status}1", date=date(2027, 11, 10)
+            )
+            with self.subTest(status=status):
+                instance = self.make_checklist(
+                    feature_release=feature_release, release=release
+                )
+                checklist_content = self.do_render_checklist(instance)
+                self.assertIn(expected, checklist_content)
+                self.assertNotInChecklistContent("two weeks", checklist_content)
+
+        release = self.factory.make_release(version="5.2b1", date=date(2025, 3, 1))
+        instance = self.make_checklist(
+            feature_release=self.factory.make_feature_release_checklist("5.2"),
+            release=release,
+        )
+        self.assertIn(
+            "scheduled roughly two weeks later on",
+            self.do_render_checklist(instance),
+        )
 
 
 class FeatureReleaseChecklistTestCase(BaseChecklistTestCaseMixin, TestCase):
@@ -1160,6 +1752,31 @@ class FeatureReleaseChecklistTestCase(BaseChecklistTestCaseMixin, TestCase):
             self.assertIn(
                 "Django 5.0 has reached the end of extended support.", checklist_content
             )
+
+    def test_render_checklist_calendar_version(self):
+        eol_release = self.factory.make_release(version="6.1", date=date(2026, 12, 3))
+        eom_release = self.factory.make_release(version="6.2", date=date(2027, 4, 1))
+        release = self.factory.make_release(version="2028", date=date(2028, 1, 14))
+        checklist = self.make_checklist(
+            release=release, eom_release=eom_release, eol_release=eol_release
+        )
+        checklist_content = self.do_render_checklist(checklist)
+        calendar_version_tasks = [
+            '    - `VERSION = (2028, 0, "final", 0)`',
+            "    - `git commit -a -m '[2028.x] Bumped version for 2028 release.'`",
+            "- [ ] BUMP **PATCH VERSION** in `django/__init__.py`\n"
+            '    - `VERSION = (2028, 1, "alpha", 0)`\n'
+            "    - `git commit -a -m '[2028.x] Post-release version bump.'`",
+            "        - Add an entry for: `2028.1`",
+            "    - Add new file `docs/releases/2028.1.txt`",
+            "Django 2028.1 fixes several bugs in 2028.",
+            "- `git checkout stable/2028.x && git pull -v`",
+        ]
+        for task in calendar_version_tasks:
+            with self.subTest(task=task):
+                self.assertIn(task, checklist_content)
+
+        self.assertNotInChecklistContent("MINOR VERSION", checklist_content)
 
 
 class NaturalKeyTestCase(TestCase):

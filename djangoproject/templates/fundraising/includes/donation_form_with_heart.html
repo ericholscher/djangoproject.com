@@ -32,14 +32,6 @@
             To reach our goal, we should have raised ${{ expected }} by this point
           {% endblocktranslate %}
         </li>
-        <li>
-          {% url 'members:corporate-members-join' as corp_join_url %}
-          {% blocktranslate trimmed %}
-            Companies able to make a <strong>larger donation</strong>
-            ($2,000+/year) are invited to apply to be Corporate Members
-            <a href="{{ corp_join_url }}">here</a>.
-          {% endblocktranslate %}
-        </li>
       </ul>
 
       <div class="donate">

@@ -1,4 +1,5 @@
 from datetime import date
+from unittest import mock
 
 from django.contrib.auth.models import Permission, User
 from django.core.exceptions import ValidationError
@@ -9,6 +10,23 @@ from djmoney.money import Money
 from djangoproject.tests import ReleaseMixin
 
 from .models import ApprovedGrant, Banner, BoardMember, Business, Meeting, Office, Term
+
+
+@mock.patch("foundation.models.purge_docs_html")
+class BannerCachePurgeTests(TestCase):
+    def test_active_banner_changes_purge(self, purge):
+        with self.captureOnCommitCallbacks(execute=True):
+            banner = Banner.objects.create(title="Live", is_active=True)
+            banner.is_active = False
+            banner.save()
+        self.assertEqual(purge.call_count, 2)
+
+    def test_inactive_banner_changes_dont_purge(self, purge):
+        with self.captureOnCommitCallbacks(execute=True):
+            banner = Banner.objects.create(title="Draft")
+            banner.save()
+            banner.delete()
+        purge.assert_not_called()
 
 
 class BannerTestCase(ReleaseMixin, TestCase):
@@ -46,12 +64,23 @@ class BannerTestCase(ReleaseMixin, TestCase):
         )
         response = self.client.get("/")
         self.assertContains(response, "<h2>Support Django!</h2>", html=True)
-        self.assertContains(response, "Please donate.")
+        self.assertContains(
+            response, '<div class="banner-body">Please donate.</div>', html=True
+        )
         self.assertContains(
             response,
             '<a id="banner-cta" class="cta" href="https://djangoproject.com/donate/">'
             "Donate</a>",
             html=True,
+        )
+
+    def test_banner_renders_above_the_page_hero(self):
+        Banner.objects.create(title="Support Django!", is_active=True)
+        response = self.client.get("/")
+        content = response.content.decode()
+        self.assertLess(
+            content.index('<div id="billboard">'),
+            content.index('<section class="copy-banner">'),
         )
 
     def test_cta_label_without_url_raises_validation_error(self):
@@ -139,6 +168,11 @@ class BannerTestCase(ReleaseMixin, TestCase):
     def test_fundraising_page_suppresses_banner(self):
         Banner.objects.create(title="Donate now!", is_active=True)
         response = self.client.get("/fundraising/")
+        self.assertNotContains(response, "Donate now!")
+
+    def test_sponsor_banner_page_suppresses_banner(self):
+        Banner.objects.create(title="Donate now!", is_active=True)
+        response = self.client.get("/sponsor/banner/")
         self.assertNotContains(response, "Donate now!")
 
 

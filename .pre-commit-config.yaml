@@ -21,33 +21,28 @@ repos:
           - id: end-of-file-fixer
             exclude: '(^djangoproject\/static\/js\/lib\/.*$)'
             exclude_types: [json, sql]
-          - id: file-contents-sorter
-            files: ^(requirements/\w*.txt)$
-            args: ["--ignore-case"]
           - id: fix-byte-order-marker
           - id: mixed-line-ending
           - id: trailing-whitespace
 
     - repo: https://github.com/asottile/pyupgrade
-      rev: v3.21.2
+      rev: v3.22.0
       hooks:
           - id: pyupgrade
             args: [--py312]
 
     - repo: https://github.com/adamchainz/django-upgrade
-      rev: 1.29.1
+      rev: 1.33.0
       hooks:
           - id: django-upgrade
-            args: [--target-version, "6.0"]
 
     - repo: https://github.com/psf/black-pre-commit-mirror
-      rev: 25.12.0
+      rev: 26.10.1
       hooks:
           - id: black
-            args: ["--target-version=py312"]
 
     - repo: https://github.com/rbubley/mirrors-prettier
-      rev: v3.7.4
+      rev: v3.9.10
       hooks:
           - id: prettier
             # https://github.com/rbubley/mirrors-prettier/issues/3
@@ -55,28 +50,76 @@ repos:
             exclude_types: [html, json, scss]
             exclude: '(^djangoproject\/static\/js\/lib\/.*$|^checklists\/templates\/.*$)'
 
-    - repo: https://github.com/pycqa/isort
-      rev: 7.0.0
-      hooks:
-          - id: isort
-
     - repo: https://github.com/pycqa/flake8
-      rev: 7.3.0
+      rev: 7.5.0
       hooks:
           - id: flake8
 
+    - repo: https://github.com/astral-sh/ruff-pre-commit
+      rev: v0.17.2
+      hooks:
+          - id: ruff-check
+            args: ["--fix", "--show-fixes"]
+          - id: ruff-format
+
     - repo: https://github.com/rtts/djhtml
-      rev: 3.0.10
+      rev: 3.0.11
       hooks:
           - id: djhtml
             files: .*/templates/.*\.html$
 
     - repo: https://github.com/mrtazz/checkmake.git
-      rev: 0.2.2
+      rev: v0.3.2
       hooks:
           - id: checkmake
     - repo: https://github.com/adamchainz/djade-pre-commit
-      rev: 1.7.0
+      rev: 1.10.0
       hooks:
           - id: djade
             args: [--target-version, "6.0"]
+
+    - repo: https://github.com/tox-dev/pyproject-fmt
+      rev: v2.30.3
+      hooks:
+          - id: pyproject-fmt
+
+    - repo: https://github.com/astral-sh/uv-pre-commit
+      rev: 0.13.5
+      hooks:
+          - name: Check lock file
+            id: uv-lock
+          - name: Check requirements/dev.txt
+            id: uv-export
+            args:
+                [
+                    "--frozen",
+                    "--quiet",
+                    "--group",
+                    "dev",
+                    "--output-file=requirements/dev.txt",
+                    "--no-hashes",
+                ]
+          - name: Check requirements/tests.txt
+            id: uv-export
+            args:
+                [
+                    "--frozen",
+                    "--quiet",
+                    "--group",
+                    "tests",
+                    "--no-dev",
+                    "--output-file=requirements/tests.txt",
+                    "--no-hashes",
+                ]
+          - name: Check requirements/prod.txt
+            id: uv-export
+            args:
+                [
+                    "--frozen",
+                    "--quiet",
+                    "--group",
+                    "prod",
+                    "--no-dev",
+                    "--output-file=requirements/prod.txt",
+                    "--no-hashes",
+                ]

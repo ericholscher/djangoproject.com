@@ -162,13 +162,7 @@ class DocumentRelease(models.Model):
     def is_supported(self):
         if self.release is None:
             return True
-        latest_release = (
-            Release.objects.filter(
-                major=self.release.major, minor=self.release.minor, status="f"
-            )
-            .order_by("-micro")
-            .first()
-        )
+        latest_release = Release.objects.in_feature_series(self.release).first()
         if latest_release is None:
             return True
         eol_date = latest_release.eol_date
@@ -290,7 +284,11 @@ def _clean_document_path(path):
 
 
 def document_url(doc):
-    if doc.metadata.get("parents") == DocumentationCategory.WEBSITE:
+    try:
+        parents = doc.parents  # From a search()/search_results() annotation.
+    except AttributeError:
+        parents = doc.metadata.get("parents")
+    if parents == DocumentationCategory.WEBSITE:
         return doc.path
     elif doc.path:
         kwargs = {
@@ -322,20 +320,24 @@ class DocumentQuerySet(models.QuerySet):
         else:
             return self.none()
 
+    @property
+    def uses_trigram(self):
+        return "-similarity" in self.query.order_by
+
     def search(self, query_text, release, document_category=None):
         """Use full-text search to return documents matching query_text."""
+        ranked_ids = self.rank(query_text, release, document_category=document_category)
+        return self.annotate_search_results(
+            ranked_ids, query_text, uses_trigram=ranked_ids.uses_trigram
+        )
+
+    def rank(self, query_text, release, document_category=None):
         query_text = query_text.strip()
         if query_text:
             search_query = SearchQuery(
                 query_text, config=models.F("config"), search_type="websearch"
             )
             search_rank = SearchRank(models.F("search_vector"), search_query)
-            search = partial(
-                SearchHeadline,
-                start_sel=START_SEL,
-                stop_sel=STOP_SEL,
-                config=models.F("config"),
-            )
             base_filter = Q(release_id=release.id)
             if release.lang == settings.DEFAULT_LANGUAGE_CODE and not release.is_dev:
                 # Fetch the "dev" release explicitly so we can filter by release_id.
@@ -353,33 +355,11 @@ class DocumentQuerySet(models.QuerySet):
                 )
             if document_category:
                 base_filter &= Q(metadata__parents__startswith=document_category)
-            base_qs = (
-                self.select_related("release__release")
-                .filter(base_filter)
-                .annotate(
-                    headline=search("title", search_query),
-                    highlight=search(
-                        KeyTextTransform("body", "metadata"),
-                        search_query,
-                    ),
-                    searched_python_objects=search(
-                        KeyTextTransform("python_objects_search", "metadata"),
-                        search_query,
-                        highlight_all=True,
-                    ),
-                    breadcrumbs=models.F("metadata__breadcrumbs"),
-                    python_objects=models.F("metadata__python_objects"),
-                )
-                .only(
-                    "path",
-                    "release__lang",
-                    "release__release__version",
-                )
-            )
+            base_qs = self.filter(base_filter).values_list("pk", flat=True)
             vector_qs = (
                 base_qs.alias(rank=search_rank)
                 .filter(search_vector=search_query)
-                .order_by("-rank")
+                .order_by("-rank", "pk")
             )
             if not vector_qs:
                 return (
@@ -389,12 +369,54 @@ class DocumentQuerySet(models.QuerySet):
                         )
                     )
                     .filter(similarity__gt=0.3)
-                    .order_by("-similarity")
+                    .order_by("-similarity", "pk")
                 )
             else:
                 return vector_qs
         else:
             return self.none()
+
+    def annotate_search_results(self, ranked_ids, query_text, uses_trigram=False):
+        query_text = query_text.strip()
+        search_query = SearchQuery(
+            query_text, config=models.F("config"), search_type="websearch"
+        )
+        # Repeating the search rank is cheap. When CompositeFields merge, we
+        # will be able to pass through .values("similarity", "pk") from the
+        # subquery and reference it in the outer query.
+        search_rank = (
+            TrigramSimilarity("title", utils.sanitize_for_trigram(query_text))
+            if uses_trigram
+            else SearchRank(models.F("search_vector"), search_query)
+        )
+        search = partial(
+            SearchHeadline,
+            start_sel=START_SEL,
+            stop_sel=STOP_SEL,
+            config=models.F("config"),
+        )
+        return (
+            self.filter(id__in=ranked_ids)
+            .alias(rank=search_rank)
+            .annotate(
+                headline=search("title", search_query),
+                highlight=search(
+                    KeyTextTransform("body", "metadata"),
+                    search_query,
+                ),
+                searched_python_objects=search(
+                    KeyTextTransform("python_objects_search", "metadata"),
+                    search_query,
+                    highlight_all=True,
+                ),
+                breadcrumbs=models.F("metadata__breadcrumbs"),
+                python_objects=models.F("metadata__python_objects"),
+                parents=KeyTextTransform("parents", "metadata"),
+            )
+            .select_related("release__release")
+            .only("path", "release__lang", "release__release__version")
+            .order_by("-rank", "pk")
+        )
 
 
 class Document(models.Model):

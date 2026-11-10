@@ -1,7 +1,9 @@
 import datetime
 import json
+import re
 
 from django.contrib.auth.models import User
+from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator
 from django.db import models
 from django.db.models.functions import Cast, Substr
@@ -16,6 +18,12 @@ from releases.models import Release
 from .templatetags.checklist_extras import enumerate_items, format_releases_for_cves
 
 CNA_DSF_UUID = "6a34fbeb-21d4-45e7-8e0a-62b95bc12c92"
+
+
+# Several fields (credit names, CWE and CAPEC types) hold a comma separated
+# list in a single text field.
+def split_comma_separated(value):
+    return [i.strip() for i in value.split(",") if i.strip()] if value else []
 
 
 # CVE IDs have the form CVE-YYYY-NNNNN. The year (4 digits) is always at
@@ -68,6 +76,15 @@ def get_cve_default():
     return f"CVE-{datetime.date.today().year}-{get_random_string(5)}"
 
 
+def get_unsupported_series_default():
+    """Comma separated list of the 3 most recently EOL'd feature versions.
+
+    Return an empty string when no unsupported releases are known.
+    """
+    series = [f"{r.feature_version}.x" for r in Release.objects.unsupported()[:3]]
+    return enumerate_items(series)
+
+
 def get_cvss_severity(score):
     if not score:
         return "NONE"
@@ -88,7 +105,7 @@ class ReleaserManager(models.Manager):
 
 
 class Releaser(models.Model):
-    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    user = models.ForeignKey(User, on_delete=models.PROTECT)
     key_id = models.CharField(
         max_length=100, help_text="gpg --list-keys --keyid-format LONG"
     )
@@ -271,7 +288,8 @@ class PreRelease(ReleaseChecklist):
     @cached_property
     def slug(self):
         slug_version = self.release.feature_version.replace(".", "")
-        return f"django-{slug_version}-{self.status_reversed}-released"
+        iteration = self.release.iteration
+        return f"django-{slug_version}-{self.status_reversed}-{iteration}-released"
 
 
 class BugFixReleaseManager(models.Manager):
@@ -418,6 +436,15 @@ class SecurityRelease(ReleaseChecklist):
     def get_absolute_url(self):
         return reverse("checklists:securityrelease_checklist", kwargs={"pk": self.pk})
 
+    def cves_for_release(self, release):
+        if release == "main":
+            cves = self.cves
+        else:
+            cves = self.securityissue_set.filter(releases=release).order_by(
+                *cve_sort_key()
+            )
+        return cves
+
 
 class SecurityIssueReleasesThroughManager(models.Manager):
     def get_by_natural_key(self, cve_year_number, version):
@@ -430,15 +457,23 @@ class SecurityIssueReleasesThrough(models.Model):
     securityissue = models.ForeignKey(
         "SecurityIssue", on_delete=models.CASCADE, verbose_name="Security Issue"
     )
-    release = models.ForeignKey(Release, on_delete=models.CASCADE)
+    release = models.ForeignKey(Release, on_delete=models.PROTECT)
     commit_hash = models.CharField(
         max_length=128, default="", blank=True, db_index=True
     )
+    introduced_in = models.ForeignKey(
+        Release,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text=(
+            "First affected release in this series. Leave blank when the whole "
+            "series is affected."
+        ),
+    )
 
     objects = SecurityIssueReleasesThroughManager()
-
-    def natural_key(self):
-        return self.securityissue.natural_key() + (self.release.version,)
 
     class Meta:
         constraints = [
@@ -452,6 +487,72 @@ class SecurityIssueReleasesThrough(models.Model):
                 condition=~models.Q(commit_hash=""),  # Exclude empty strings
             ),
         ]
+
+    def natural_key(self):
+        return self.securityissue.natural_key() + (self.release.version,)
+
+    def clean(self):
+        super().clean()
+        if self.introduced_in is None or self.release_id is None:
+            return
+
+        error = None
+        if self.introduced_in.feature_version != self.release.feature_version:
+            error = "Must be a release in the same series as release."
+        elif self.introduced_in.is_pre_release:
+            # A flaw already present in a pre-release affects the series from
+            # its feature version, which is what leaving this blank expresses.
+            error = "Must be a final release."
+        elif not self.introduced_in < self.release:
+            error = "Must be older than release."
+        if error is not None:
+            raise ValidationError({"introduced_in": error})
+
+    @property
+    def first_affected_version(self):
+        return (
+            self.release.feature_version
+            if self.introduced_in is None
+            else self.introduced_in.version
+        )
+
+    @property
+    def affected_version_range(self):
+        # The unaffected entries are redundant, since the product's
+        # defaultStatus already marks anything unlisted as unaffected. The
+        # fixed release has always been stated explicitly, and for a
+        # regression it is worth saying which releases of the series were
+        # evaluated and found sound.
+        entries = []
+        # Nothing precedes the feature release, so naming it as the first
+        # affected one leaves an empty range.
+        if self.introduced_in is not None and (
+            self.introduced_in.version != self.release.feature_version
+        ):
+            entries.append(
+                {
+                    "status": "unaffected",
+                    "version": self.release.feature_version,
+                    "lessThan": self.introduced_in.version,
+                    "versionType": "python",
+                }
+            )
+        entries.extend(
+            [
+                {
+                    "status": "affected",
+                    "version": self.first_affected_version,
+                    "lessThan": self.release.version,
+                    "versionType": "python",
+                },
+                {
+                    "status": "unaffected",
+                    "version": self.release.version,
+                    "versionType": "python",
+                },
+            ]
+        )
+        return entries
 
 
 class SecurityIssueManager(models.Manager):
@@ -488,16 +589,62 @@ class SecurityIssue(models.Model):
         ),
     )
     description = models.TextField(help_text=DESCRIPTION_HELP_TEXT)
+    unsupported_series = models.CharField(
+        "Unsupported series note",
+        max_length=1024,
+        blank=True,
+        default=get_unsupported_series_default,
+        help_text=(
+            'Comma separated versions (such as "5.0.x, 4.1.x, and 3.2.x") '
+            "used in the CVE description noting that earlier, unsupported "
+            "Django series were not evaluated and may also be affected. "
+            "Leave blank to omit that sentence entirely."
+        ),
+    )
     blogdescription = models.TextField(
         blank=True,
         verbose_name="Blog description",
         help_text=(
             "Markdown format. Single `backticks` for inline code. "
-            "Copy from release notes, include severity sentence.",
+            "Copy from release notes, include severity sentence."
         ),
     )
-    reporter = models.CharField(max_length=1024, blank=True)
-    remediator = models.CharField(max_length=1024, blank=True)
+    reporter = models.CharField(
+        max_length=1024,
+        blank=True,
+        help_text=(
+            "Comma separated list of names, one per person reporting the issue. "
+            'Each name gets its own "reporter" entry in the CVE credits.'
+        ),
+    )
+    remediator = models.CharField(
+        max_length=1024,
+        blank=True,
+        help_text=(
+            "Comma separated list of names, one per person developing the fix. "
+            'Each name gets its own "remediation developer" entry in the CVE '
+            "credits."
+        ),
+    )
+    reviewer = models.CharField(
+        max_length=1024,
+        blank=True,
+        help_text=(
+            "Optional. Comma separated list of names, one per person reviewing "
+            'the fix. Each name gets its own "remediation reviewer" entry in '
+            "the CVE credits. Leave blank to omit these credits."
+        ),
+    )
+    analyst = models.CharField(
+        max_length=1024,
+        blank=True,
+        help_text=(
+            "Optional. Comma separated list of names, one per person analyzing "
+            "the issue (triage, severity and CVSS scoring). Each name gets its "
+            'own "analyst" entry in the CVE credits. Leave blank to omit these '
+            "credits, or when the analysis was done by the release coordinator."
+        ),
+    )
     discovery = models.CharField(
         max_length=128,
         choices={
@@ -602,11 +749,15 @@ class SecurityIssue(models.Model):
     release = models.ForeignKey(
         SecurityRelease,
         help_text="Security Release that will fix this issue.",
-        on_delete=models.CASCADE,
+        on_delete=models.PROTECT,
         null=True,
         blank=True,
     )
-    releases = models.ManyToManyField(Release, through=SecurityIssueReleasesThrough)
+    releases = models.ManyToManyField(
+        Release,
+        through=SecurityIssueReleasesThrough,
+        through_fields=("securityissue", "release"),
+    )
     commit_hash_main = models.CharField(
         max_length=128, default="", blank=True, db_index=True
     )
@@ -618,19 +769,61 @@ class SecurityIssue(models.Model):
         return (self.cve_year_number,)
 
     @cached_property
-    def cve_description(self):
-        affected = format_releases_for_cves(self.releases.all())
-        return (
-            f"An issue was discovered in {affected}.\n{self.description}\n"
-            "Earlier, unsupported Django series (such as 5.0.x, 4.1.x, and 3.2.x) "
-            "were not evaluated and may also be affected.\n"
-            f"Django would like to thank {self.reporter} for reporting this issue."
+    def reporters(self):
+        return split_comma_separated(self.reporter)
+
+    @cached_property
+    def remediators(self):
+        return split_comma_separated(self.remediator)
+
+    @cached_property
+    def reviewers(self):
+        return split_comma_separated(self.reviewer)
+
+    @cached_property
+    def analysts(self):
+        return split_comma_separated(self.analyst)
+
+    @cached_property
+    def reporters_display(self):
+        return enumerate_items(self.reporters)
+
+    @cached_property
+    def remediators_display(self):
+        return enumerate_items(self.remediators)
+
+    @cached_property
+    def affected_ranges(self):
+        # Newest first, by version components: ordering by the version string
+        # would compare "6" against "2" and put 6.2.7 ahead of 2029.1.
+        return list(
+            self.securityissuereleasesthrough_set.select_related(
+                "release", "introduced_in"
+            )
+            .filter(release__status="f")
+            .order_by("-release__major", "-release__minor", "-release__micro")
         )
+
+    @cached_property
+    def cve_description(self):
+        affected = format_releases_for_cves(self.affected_ranges)
+        parts = [f"An issue was discovered in Django {affected}.", self.description]
+        if self.unsupported_series:
+            parts.append(
+                f"Earlier, unsupported Django series (such as {self.unsupported_series})"
+                " were not evaluated and may also be affected."
+            )
+        if self.reporters:
+            parts.append(
+                f"Django would like to thank {self.reporters_display} for "
+                "reporting this issue."
+            )
+        return "\n".join(parts)
 
     @cached_property
     def cve_html_description(self):
         return "".join(
-            f"<p>{line.strip()}</p>"
+            f"<p>{re.sub(r'`([^`]+)`', r'<code>\1</code>', line.strip())}</p>"
             for line in urlize(self.cve_description).split("\n")
         )
 
@@ -666,25 +859,11 @@ class SecurityIssue(models.Model):
 
     @property
     def cve_data(self):
-        affected_unaffected_versions = []
-        versions = []
-        for release in self.releases.filter(status="f").order_by("-version"):
-            versions.append(release.version)
-            affected_unaffected_versions.extend(
-                [
-                    {
-                        "status": "affected",
-                        "version": f"{release.feature_version}",
-                        "lessThan": release.version,
-                        "versionType": "python",
-                    },
-                    {
-                        "status": "unaffected",
-                        "version": release.version,
-                        "versionType": "python",
-                    },
-                ]
-            )
+        affected_unaffected_versions = [
+            entry
+            for affected_range in self.affected_ranges
+            for entry in affected_range.affected_version_range
+        ]
         dates = {"timeline": []}
         if self.reported_at:
             dates["timeline"].append(
@@ -714,22 +893,25 @@ class SecurityIssue(models.Model):
                 "name": "Django releases announcements",
                 "tags": ["mailing-list"],
             },
+            *[
+                {
+                    "tags": ["patch"],
+                    "url": f"https://github.com/django/django/commit/{commit_hash}",
+                }
+                for _, commit_hash in self.hashes_by_branch
+                if commit_hash
+            ],
         ]
         credits = [
-            {
-                "lang": "en",
-                "type": "reporter",
-                "value": self.reporter,
-            },
+            {"lang": "en", "type": credit_type, "value": name}
+            for credit_type, names in [
+                ("reporter", self.reporters),
+                ("analyst", self.analysts),
+                ("remediation developer", self.remediators),
+                ("remediation reviewer", self.reviewers),
+            ]
+            for name in names
         ]
-        if self.remediator:
-            credits.append(
-                {
-                    "lang": "en",
-                    "type": "remediation developer",
-                    "value": self.remediator,
-                }
-            )
 
         if self.release:
             dates["datePublic"] = when = self.release.when.isoformat()
@@ -840,23 +1022,25 @@ class SecurityIssue(models.Model):
                             "descriptions": [
                                 {
                                     "lang": "en",
-                                    "cweId": self.cve_type.split(":")[0],
-                                    "description": self.cve_type,
+                                    "cweId": cwe.split(":")[0],
+                                    "description": cwe,
                                     "type": "CWE",
-                                },
+                                }
+                                for cwe in split_comma_separated(self.cve_type)
                             ],
                         },
                     ],
                     "impacts": [
                         {
-                            "capecId": self.impact.split(":")[0],
+                            "capecId": capec.split(":")[0],
                             "descriptions": [
                                 {
                                     "lang": "en",
-                                    "value": self.impact,
+                                    "value": capec,
                                 },
                             ],
-                        },
+                        }
+                        for capec in split_comma_separated(self.impact)
                     ],
                     **details,
                 },

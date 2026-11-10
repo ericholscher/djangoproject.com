@@ -1,3 +1,4 @@
+{% load hosts i18n %}
 {% if members %}
   <div class="corporate-members">
     <h3>{{ header }}</h3>
@@ -5,7 +6,15 @@
       <div class="clearfix">
         <div class="member-logo">
           <a href="{{ obj.url }}" title="{{ obj.display_name }}">
-            <img src="{{ obj.thumbnail.url }}" alt="{{ obj.display_name }}" />
+            {% if obj.logo %}
+              <img
+                {% if obj.thumbnail %}
+                  src="{{ obj.thumbnail.url }}"
+                {% else %}
+                  src="{{ obj.logo.url }}"
+                {% endif %}
+                alt="{{ obj.display_name }}" />
+            {% endif %}
           </a>
         </div>
         <div class="small-cta">
@@ -18,5 +27,8 @@
         </div>
       </div>
     {% endfor %}
+    <ul class="list-links-small">
+      <li><a href="{% host_url 'sponsor' host 'www' %}">{% translate "Become a sponsor" %}</a></li>
+    </ul>
   </div>
 {% endif %}

@@ -1,5 +1,5 @@
-{% load checklist_extras %}
-# Django {{ release.version_verbose }} {{ title }} - {{ when|date }}
+{% load checklist_extras tz %}
+# Django {{ release.version_verbose }} {{ title }} - {{ when|utc|date:"N j, Y, P" }}
 
 {% if release.status == "a" %}
 ## One or Two months before Feature Freeze
@@ -40,6 +40,11 @@ At this point, most of the larger features planned for {{ release.feature_versio
     - `git checkout -b {{ release.stable_branch }} origin/{{ instance.eom_release.stable_branch }}`
     - `git push origin {{ release.stable_branch }}:{{ release.stable_branch }}`
 {% elif release.status == "a" %}
+
+- [ ] Request the new classifier on PyPI by making a PR:
+    - `Framework :: Django :: {{ release.feature_version }}`
+    - e.g. https://github.com/pypa/trove-classifiers/pulls?q=is%3Apr+django+trove+classifier
+
 ## Feature Freeze Day
 {% include 'checklists/_feature_freeze.md' with final_version=release.feature_version %}
 {% endif %}
@@ -106,10 +111,8 @@ At this point, most of the larger features planned for {{ release.feature_versio
 
     - Ensure that the release's dedicated virtual environment is enabled and run the following:
         - `cd django`
-        - `django-admin makemessages -l en --domain=djangojs --domain=django`
-
-    - Review the diff before pushing and avoid committing changes to the `.po` files without any new translations.
-        - e.g. https://github.com/django/django/commit/d2b1ec551567c208abfdd21b27ff6d08ae1a6371.
+        - `django-admin makemessages -l en --domain=django`
+        - `django-admin makemessages -l en --domain=djangojs`
 
     - Make a pull request against the corresponding stable branch and merge once approved.
 
@@ -127,7 +130,7 @@ At this point, most of the larger features planned for {{ release.feature_versio
 Hello Translators!
 
 Django {{ release.version_verbose }} was [released today]({{ instance.blogpost_link }}), establishing the string freeze for the {{ release.feature_version }} release.
-This means that strings marked for translations will not change between now and the final release, scheduled for approximately two weeks from now.
+This means that strings marked for translations will not change between now and the final release, scheduled for approximately {% if release.is_calendar_version %}a month{% else %}two weeks{% endif %} from now.
 
 It would be extremely helpful if you could ensure that the Django translations for the languages you contribute to are complete on [Transifex](https://explore.transifex.com/django/django/).
 We will be fetching the available translations a few days before the final release.
